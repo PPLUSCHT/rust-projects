@@ -12,7 +12,7 @@ use crate::simplex::Simplex;
 use crate::helper_functions::{add_to_slice, distance};
 fn main() {
    let guess = vec![1.0; 3].into_boxed_slice();
-   let mut simplex = Simplex::from_guess(guess, 10.0, example_functions::dot_product).unwrap();
+   let simplex = Simplex::from_guess(guess, 10.0, example_functions::dot_product).unwrap();
    let mut nelder_meade = NelderMeade{
     simplex: simplex,
     reflection: 1.0,
