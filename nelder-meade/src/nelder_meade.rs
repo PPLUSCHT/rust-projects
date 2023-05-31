@@ -155,7 +155,6 @@ impl NelderMeade{
             let previous_worst = self.simplex.points[needed_points[2]].value;
             self.step(&needed_points);
             function_change = absolute_value(previous_worst - self.simplex.points[needed_points[2]].value);
-            println!("{}", function_change);
         }
     }
 
