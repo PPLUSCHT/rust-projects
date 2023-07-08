@@ -1,3 +1,5 @@
+use wgpu::Device;
+
 pub struct Driver{
     pub size: winit::dpi::PhysicalSize<u32>,
     pub surface: wgpu::Surface,
@@ -29,7 +31,8 @@ impl Driver{
         .request_device(
             &wgpu::DeviceDescriptor {
                 label: None,
-                features: wgpu::Features::VERTEX_WRITABLE_STORAGE,
+                features: adapter.features(),
+                // features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
                 limits: wgpu::Limits::default(),
             },

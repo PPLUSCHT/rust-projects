@@ -1,7 +1,8 @@
 use std::{mem, borrow::Cow};
+use barrier_shapes::line::Line as line;
 
 use wgpu::{BindGroupDescriptor, util::{DeviceExt, BufferInitDescriptor}, BufferUsages, VertexBufferLayout, vertex_attr_array, BindGroupLayout, CommandEncoder};
-use crate::driver::Driver;
+use crate::{driver::Driver, barrier_shapes::{self, merge_shapes::merge, Shape}};
 pub struct Simulation<const X:u32, const Y:u32>{
     
     pub dimension_bind_group: wgpu::BindGroup,
@@ -21,10 +22,18 @@ pub struct Simulation<const X:u32, const Y:u32>{
     pub color_pipeline: wgpu::ComputePipeline,
     pub curl_pipeline: wgpu::ComputePipeline,
 
+    pub compute_num: usize,
     pub frame_num: usize,
+    pub work_group_count: usize,
 }
 
 impl<const X:u32, const Y:u32> Simulation<X, Y>{
+
+    fn calculate_work_group_count() -> usize{
+        let x_dim = X.to_owned() as f32;
+        let y_dim = Y.to_owned() as f32;
+        (x_dim * y_dim/256.0).ceil() as usize
+    }
 
     fn create_dimensions_bg(driver: &Driver, dimensions_buffer: &wgpu::Buffer) -> (wgpu::BindGroupLayout ,wgpu::BindGroup){
 
@@ -636,7 +645,6 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
     pub async fn new(driver: &Driver, omega: f32) -> Simulation<X,Y>{
         
         //create common resources
-        let init_state = Self::set_equil(0.1, 0.0, 1.0);
         let barriers = Self::init_barrier(&driver.device);
 
         let dimensions_buffer = driver.device.create_buffer_init(&BufferInitDescriptor{
@@ -696,26 +704,30 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
             render_pipeline,
             color_pipeline,
             curl_pipeline,
+            compute_num: 0,
             frame_num: 0,
+            work_group_count: Self::calculate_work_group_count(),
         }
     }
 
     pub fn iterate(&mut self, driver: &Driver, compute_steps: usize){
-        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        for i in 0..compute_steps{
-            self.compute_step(driver, &mut encoder);
+        for _ in 0..compute_steps{
+            let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            self.compute_step( &mut encoder);
+            driver.queue.submit(Some(encoder.finish()));
         }
-        self.curl(driver, &mut encoder);
-        self.color_map(driver, &mut encoder);
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.curl(&mut encoder);
+        self.color_map(&mut encoder);
         driver.queue.submit(Some(encoder.finish()));
         self.render(driver);
     }
 
-    fn compute_step(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        self.collide(driver, encoder);
-        self.stream_cardinal(driver, encoder);
-        self.stream_corner(driver, encoder);
-        self.frame_num += 1;
+    fn compute_step(&mut self, encoder: &mut CommandEncoder){
+        self.collide(encoder);
+        self.stream_cardinal(encoder);
+        self.stream_corner(encoder);
+        self.compute_num += 1;
     }
 
     fn render(&mut self, driver: &Driver) {
@@ -745,58 +757,54 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
         }
         driver.queue.submit(Some(encoder.finish()));
         frame.present();
+        self.frame_num += 1;
     }
 
 
-    fn collide(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        let work_group_count = X * Y  as u32;
+    fn collide(&mut self, encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&self.collide_pipeline);
         cpass.set_bind_group(0, &self.collide_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[self.frame_num % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[self.frame_num % 2], &[]);
+        cpass.set_bind_group(1, &self.corner_bind_groups[self.compute_num % 2], &[]);
+        cpass.set_bind_group(2, &self.cardinal_bind_groups[self.compute_num % 2], &[]);
         cpass.set_bind_group(3, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(work_group_count, 1, 1);
+        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
     }
 
-    fn stream_cardinal(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        let work_group_count = X * Y  as u32;
+    fn stream_cardinal(&mut self,  encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&self.stream_cardinal_pipeline);
         cpass.set_bind_group(0, &self.stream_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.cardinal_bind_groups[self.frame_num % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.frame_num + 1) % 2], &[]);
-        cpass.dispatch_workgroups(work_group_count, 1, 1);
+        cpass.set_bind_group(1, &self.cardinal_bind_groups[self.compute_num % 2], &[]);
+        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.compute_num + 1) % 2], &[]);
+        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
     }
     
-    fn stream_corner(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        let work_group_count = X * Y  as u32;
+    fn stream_corner(&mut self, encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&self.stream_corner_pipeline);
         cpass.set_bind_group(0, &self.stream_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[self.frame_num % 2], &[]);
-        cpass.set_bind_group(2, &self.corner_bind_groups[(self.frame_num + 1) % 2], &[]);
-        cpass.dispatch_workgroups(work_group_count, 1, 1);
+        cpass.set_bind_group(1, &self.corner_bind_groups[self.compute_num % 2], &[]);
+        cpass.set_bind_group(2, &self.corner_bind_groups[(self.compute_num + 1) % 2], &[]);
+        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
     }
 
-    fn curl(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        let work_group_count = X * Y  as u32;
+    fn curl(&mut self, encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&self.curl_pipeline);
         cpass.set_bind_group(0, &self.dimension_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[(self.frame_num + 1) % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.frame_num + 1) % 2], &[]);
+        cpass.set_bind_group(1, &self.corner_bind_groups[(self.compute_num + 1) % 2], &[]);
+        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.compute_num + 1) % 2], &[]);
         cpass.set_bind_group(3, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(work_group_count, 1, 1);
+        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
     }
 
-    fn color_map(&mut self, driver: &Driver, encoder: &mut CommandEncoder){
-        let work_group_count = X * Y  as u32;
+    fn color_map(&mut self,  encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&self.color_pipeline);
         cpass.set_bind_group(0, &self.color_bind_group, &[]);
         cpass.set_bind_group(1, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(work_group_count, 1, 1);
+        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
     }
 
     fn set_equil(mut ux: f32, mut uy: f32, rho: f32) -> Vec<Vec<f32>>{
@@ -852,28 +860,29 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
     fn init_barrier(device: &wgpu::Device) -> wgpu::Buffer{
         
         let mut border_vec = vec![0_u32; X as usize * Y as usize];
-        let chevron_height = std::cmp::min(Y/5,X/5);
-        let start_y = Y/2;
-        let start_x = X/3;
 
         for i in 0..X{
             border_vec[Self::index(i, 0) as usize] = 1;
             border_vec[Self::index(i, Y - 1) as usize] =1;
         }
-        for i in 0..chevron_height{
-            border_vec[Self::index(start_x - i, start_y + i) as usize] = 1;
-            border_vec[Self::index(start_x - i - 1, start_y + i) as usize] = 1;
-            border_vec[Self::index(start_x - i - 2, start_y + i) as usize] = 1;
 
-            border_vec[Self::index(start_x - i, start_y - i) as usize] = 1;
-            border_vec[Self::index(start_x - i - 1, start_y - i) as usize] = 1;
-            border_vec[Self::index(start_x - i - 2, start_y - i) as usize] = 1;
+        let lines:Vec<Box<dyn Shape>> = vec![
+                                        Box::new(line::new((100,1),(100,400), X as isize, Y as isize).unwrap()),
+                                        Box::new(line::new((101,1),(101,400), X as isize, Y as isize).unwrap()),
+
+                                        Box::new(line::new((100,1023),(100,624), X as isize, Y as isize).unwrap()),
+                                        Box::new(line::new((101,1023),(101,624), X as isize, Y as isize).unwrap()),
+
+                                        Box::new(line::new((150, 512), (300, 400), X as isize, Y as isize).unwrap()),
+                                        Box::new(line::new((151, 512), (301, 400), X as isize, Y as isize).unwrap()),
+
+                                        Box::new(line::new((150, 512), (300, 624), X as isize, Y as isize).unwrap()),
+                                        Box::new(line::new((151, 512), (301, 624), X as isize, Y as isize).unwrap()),
+                                    ];
+
+        for i in merge(lines, X as usize){
+            border_vec[i] = 1;
         }
-
-        // for i in 0..chevron_height{
-        //     border_vec[Self::index(start_x, start_y + i) as usize] = 1;
-        //     border_vec[Self::index(start_x, start_y - i) as usize] = 1;
-        // }
 
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor
             {

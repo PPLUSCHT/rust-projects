@@ -1,0 +1,16 @@
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8" />
+    <title>hello-wasm example</title>
+  </head>
+  <body>
+    <script type="module">
+      import init, {runner, debug} from "/pkg/lbm_web_gpu.js";
+      init().then(() => {
+        debug();
+        runner();
+      });
+    </script>
+    <h1>sup</h1>
+  </body>
+</html>

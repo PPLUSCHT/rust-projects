@@ -20,7 +20,7 @@ struct Dimensions{
 @group(3) @binding(1) var<storage, read_write> curl: array<f32>;
 
 @compute
-@workgroup_size(256,1,1)
+@workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
 
     let i = global_invocation_id.x;

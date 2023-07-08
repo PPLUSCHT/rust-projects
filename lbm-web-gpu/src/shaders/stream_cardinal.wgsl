@@ -37,7 +37,7 @@ fn s_index(index: u32) -> u32{
 }
 
 @compute
-@workgroup_size(256,1,1)
+@workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
 
     let index = global_invocation_id.x;
