@@ -1,16 +1,94 @@
 <html lang="en-US">
   <head>
     <meta charset="utf-8" />
-    <title>hello-wasm example</title>
+    <title>LBM</title>
   </head>
   <body>
     <script type="module">
-      import init, {runner, debug} from "/pkg/lbm_web_gpu.js";
+      import init, {run, WASMInteraction, SummaryStat, ColorMap} from "/pkg/lbm_web_gpu.js";
       init().then(() => {
-        debug();
-        runner();
+        run();
       });
+
+      function setCurl(){
+        WASMInteraction.set_output(SummaryStat.Curl);
+      }
+
+      function setEquilibrium(){
+        WASMInteraction.reset_to_equilibrium();
+      }
+
+      function setUX(){
+        WASMInteraction.set_output(SummaryStat.Ux);
+      }
+      function setUY(){
+        WASMInteraction.set_output(SummaryStat.Uy);
+      }
+
+      function setRho(){
+        WASMInteraction.set_output(SummaryStat.Rho);
+      }
+
+      function setViridis(){
+        WASMInteraction.set_color_map(ColorMap.Viridis);
+      }
+      
+      function setInferno(){
+        WASMInteraction.set_color_map(ColorMap.Inferno);
+      }
+
+      function setJet(){
+        WASMInteraction.set_color_map(ColorMap.Jet);
+      }
+
+      const curl = document.getElementById("curl-button");
+      const Ux = document.getElementById("Ux-button");
+      const Uy = document.getElementById("Uy-button");
+      const Rho = document.getElementById("Rho-button");
+      const Equilibrium = document.getElementById("Equilibrium");
+
+      const viridis = document.getElementById("Viridis");
+      const inferno = document.getElementById("Inferno");
+      const jet = document.getElementById("Jet");
+
+      const pause = document.getElementById("Pause");
+      const slider = document.getElementById("ComputeRatio");
+      const viscosity_slider = document.getElementById("Viscosity");
+
+      curl.addEventListener("click", setCurl);
+      Ux.addEventListener("click", setUX);
+      Uy.addEventListener("click", setUY);
+      Rho.addEventListener("click", setRho);
+
+      Equilibrium.addEventListener("click", setEquilibrium);
+
+      viridis.addEventListener("click", setViridis);
+      inferno.addEventListener("click", setInferno);
+      jet.addEventListener("click", setJet);
+
+      pause.addEventListener("click", WASMInteraction.toggle_pause);
+      slider.onchange = function() {
+        WASMInteraction.update_compute_rate(this.value);
+      }
+      viscosity_slider.onchange = function(){
+        WASMInteraction.update_viscosity(this.value);
+      }
     </script>
-    <h1>sup</h1>
+    <div>
+      <button id="curl-button">Curl</button>
+      <button id="Ux-button">Ux</button>
+      <button id="Uy-button">Uy</button>
+      <button id="Rho-button">Rho</button>
+
+      <button id="Viridis">Viridis</button>
+      <button id="Inferno">Inferno</button>
+      <button id="Equilibrium">Equilibrium</button>
+      <button id="Jet">Jet</button>
+
+      <button id="Pause">Pause</button>
+      <input type="range" min="1" max="100" value="50" class="slider" id="ComputeRatio">
+      <input type="range" min="0.005" max="0.5" value="0.1" class="slider" id="Viscosity" step="0.01">
+    </div>
+
   </body>
 </html>

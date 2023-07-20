@@ -3,7 +3,8 @@ struct Dimensions{
     col: u32,
 }
 
-@group(0) @binding(0) var<uniform> dimensions: Dimensions;
+@group(0) @binding(0) var<uniform> omega: f32;
+@group(0) @binding(1) var<uniform> dimensions: Dimensions;
 
 @group(1) @binding(0) var<storage, read_write> nw: array<f32>;
 @group(1) @binding(1) var<storage, read_write> ne: array<f32>;

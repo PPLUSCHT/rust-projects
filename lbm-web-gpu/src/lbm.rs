@@ -1,565 +1,653 @@
-use std::{mem, borrow::Cow};
+use web_sys::console;
+use wgpu::{CommandEncoder, util::BufferInitDescriptor, BufferUsages, ShaderStages,BindGroupDescriptor};
+use std::{mem, borrow::Cow, collections::HashSet, isize};
 use barrier_shapes::line::Line as line;
 
-use wgpu::{BindGroupDescriptor, util::{DeviceExt, BufferInitDescriptor}, BufferUsages, VertexBufferLayout, vertex_attr_array, BindGroupLayout, CommandEncoder};
-use crate::{driver::Driver, barrier_shapes::{self, merge_shapes::merge, Shape}};
-pub struct Simulation<const X:u32, const Y:u32>{
-    
-    pub dimension_bind_group: wgpu::BindGroup,
-    pub color_bind_group: wgpu::BindGroup,
-    pub corner_bind_groups: Vec<wgpu::BindGroup>,
-    pub cardinal_bind_groups: Vec<wgpu::BindGroup>,
-    pub collide_params_bind_group: wgpu::BindGroup,
-    pub origin_output_bind_group: wgpu::BindGroup,
-    pub stream_params_bind_group: wgpu::BindGroup,
+use wgpu::{Device, BindGroupEntry, util::DeviceExt, BindGroupLayout, ShaderModuleDescriptor, vertex_attr_array, VertexBufferLayout};
 
-    pub vertex_buffer: wgpu::Buffer,
+use crate::{driver::Driver, barrier_shapes::{Shape, merge_shapes::{merge, get_points_vector}, self, Point}};
+use wasm_bindgen::prelude::*;
 
-    pub collide_pipeline:wgpu::ComputePipeline,
-    pub stream_corner_pipeline: wgpu::ComputePipeline,
-    pub stream_cardinal_pipeline: wgpu::ComputePipeline,
-    pub render_pipeline: wgpu::RenderPipeline,
-    pub color_pipeline: wgpu::ComputePipeline,
-    pub curl_pipeline: wgpu::ComputePipeline,
-
-    pub compute_num: usize,
-    pub frame_num: usize,
-    pub work_group_count: usize,
+#[wasm_bindgen]
+#[derive(PartialEq, Clone, Copy)]
+pub enum SummaryStat {
+    Curl,
+    Ux,
+    Uy, 
+    Rho
 }
 
-impl<const X:u32, const Y:u32> Simulation<X, Y>{
+#[wasm_bindgen]
+#[derive(PartialEq, Clone, Copy)]
+pub enum ColorMap {
+    Inferno,
+    Viridis,
+    Jet,
+}
 
-    fn calculate_work_group_count() -> usize{
+pub struct LBM<const X: u32, const Y: u32>{
+    //Bind Groups
+    pub collide_bg: wgpu::BindGroup,
+    pub output_bg: wgpu::BindGroup,
+    pub density_bg: wgpu::BindGroup,
+    pub dimension_bg: wgpu::BindGroup,
+    pub dimension_bg_vertex: wgpu::BindGroup,
+    pub size_bg: wgpu::BindGroup,
+    pub barrier_bg: wgpu::BindGroup,
+    pub color_bg: wgpu::BindGroup,
+
+    //Directional BGS
+    pub ne_sw_bgs: Vec<wgpu::BindGroup>,
+    pub nw_se_bgs: Vec<wgpu::BindGroup>,
+    pub n_s_bgs: Vec<wgpu::BindGroup>,
+    pub e_w_bgs: Vec<wgpu::BindGroup>,
+
+    //needed Buffers
+    data_buffers: Vec<Vec<wgpu::Buffer>>,
+    barrier_buffer: wgpu::Buffer,
+    omega_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+
+    //Compute Pipelines
+    cardinal_pre_collision: wgpu::ComputePipeline,
+    corner_pre_collision: wgpu::ComputePipeline,
+    corner_collide: wgpu::ComputePipeline,
+    cardinal_collide: wgpu::ComputePipeline,
+    e_w_stream: wgpu::ComputePipeline,
+    n_s_stream: wgpu::ComputePipeline,
+    ne_sw_stream: wgpu::ComputePipeline,
+    nw_se_stream: wgpu::ComputePipeline,
+
+    //Summary/ColorMap Pipelines
+    curl: wgpu::ComputePipeline,
+    ux: wgpu::ComputePipeline,
+    uy: wgpu::ComputePipeline,
+    rho: wgpu::ComputePipeline,
+    pub color_map: ColorMap,
+    viridis: wgpu::ComputePipeline,
+    jet: wgpu::ComputePipeline,
+    inferno: wgpu::ComputePipeline,
+    summary_stat: SummaryStat,
+
+    //Render Pipeline
+    render: wgpu::RenderPipeline,
+
+    //Barrier Update Pipelines
+    barrier_draw: wgpu::ComputePipeline,
+
+    //Barrier BGS
+    draw_bg: wgpu::BindGroup,
+
+    //Update Barrier Buffers
+    draw_num: wgpu::Buffer,
+    draw_points: wgpu::Buffer,
+
+    //tracking variables
+    pub compute_step: usize,
+    frame_number: usize,
+    work_group_size: usize,
+    submitting: bool,
+
+}
+
+impl<const X: u32, const Y: u32> LBM<X, Y>{
+    
+    fn calculate_work_group_size() -> usize{
         let x_dim = X.to_owned() as f32;
         let y_dim = Y.to_owned() as f32;
         (x_dim * y_dim/256.0).ceil() as usize
     }
 
-    fn create_dimensions_bg(driver: &Driver, dimensions_buffer: &wgpu::Buffer) -> (wgpu::BindGroupLayout ,wgpu::BindGroup){
+    fn create_vertex_buffer(driver: &Driver) -> wgpu::Buffer{
+        driver.device.create_buffer_init(&BufferInitDescriptor{
+             label: None,
+             contents: bytemuck::cast_slice(&[-1.0, 1.0, -1.0, 1.0 - 2.0/Y as f32, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32, -1.0, 1.0, -1.0 + 2.0/X as f32, 1.0, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32]),
+             usage: wgpu::BufferUsages::VERTEX
+         })
+     }
 
-        let dimension_bind_group_layout = driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+    fn create_data_pair_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
+        {   entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ],
+            label: None
+        })
+    }
+
+    fn create_data_triple_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
+        {  
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ],
+            label: None
+        })
+    }
+
+    fn create_color_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
+            {  
+                entries: &[
+                    wgpu::BindGroupLayoutEntry{
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer { 
+                            ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                            has_dynamic_offset: false, 
+                            min_binding_size: wgpu::BufferSize::new((3 * X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        },
+                        count: None,
+                    }
+                ],
+                label: None
+        })
+    }
+
+    fn create_color_bg(device : &Device, color_bgl: &wgpu::BindGroupLayout) -> wgpu::BindGroup{
+        let color_vec = vec![0.0; 3 * X as usize * Y as usize];
+        let color_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(&color_vec),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: &color_bgl, 
+            entries: &[wgpu::BindGroupEntry{
+                binding: 0,
+                resource: color_buffer.as_entire_binding(),
+            }] 
+        })
+    }
+
+    fn create_data_single_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+            }],
+            label: None
+        })
+    }
+
+    fn create_barrier_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<u32>()) as _,) 
+                    },
+                    count: None,
+            }],
+            label: None
+        })
+    }
+
+    fn create_collide_bgl(
+        device : &Device
+    ) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
             label: None, 
             entries: &[
                 wgpu::BindGroupLayoutEntry{
                     binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer{
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new((2 * mem::size_of::<u32>()) as _,),
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((mem::size_of::<u32>()) as _,) 
                     },
                     count: None,
                 },
-            ],
-        });
+                wgpu::BindGroupLayoutEntry{
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry{
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Storage { read_only: false }, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ] 
+        })
+    }
 
-        let dim_bg = driver.device.create_bind_group(&wgpu::BindGroupDescriptor{
-            label: None,
-            layout: &dimension_bind_group_layout,
+    fn create_collide_bg(
+        device : &Device, 
+        origin: &wgpu::Buffer, 
+        omega_buffer: &wgpu::Buffer,
+        size_buffer: &wgpu::Buffer,
+        collide_bgl: &wgpu::BindGroupLayout
+        ) -> wgpu::BindGroup{
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: &collide_bgl, 
+            entries: &[
+                BindGroupEntry{
+                    binding: 0,
+                    resource: size_buffer.as_entire_binding(),
+                }, 
+                BindGroupEntry{
+                    binding: 1,
+                    resource: omega_buffer.as_entire_binding(),
+                },
+                BindGroupEntry{
+                    binding: 2, 
+                    resource: origin.as_entire_binding(),
+                }
+            ]
+        })
+    }
+
+    fn create_size_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
+            label: None, 
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((mem::size_of::<u32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ] 
+        })
+    }
+
+    fn create_size_bg(device : &Device, size_buffer: &wgpu::Buffer, size_bgl: &BindGroupLayout) -> wgpu::BindGroup{
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: size_bgl, 
             entries: &[
                 wgpu::BindGroupEntry{
                     binding: 0,
-                    resource: dimensions_buffer.as_entire_binding(),
+                    resource: size_buffer.as_entire_binding(),
                 }
-            ],
-        });
-
-        (dimension_bind_group_layout, dim_bg)
-
-    }
-
-    fn create_color_bg(driver: &Driver, color_bind_group_layout:&wgpu::BindGroupLayout) ->  wgpu::BindGroup{
-
-        let x_dim = X.to_owned();
-        let y_dim = Y.to_owned();
-
-        let color_buffer = driver.device.create_buffer_init(&BufferInitDescriptor{
-            label: None,
-            contents: bytemuck::cast_slice(&vec![0.0 as f32; (x_dim as usize * y_dim as usize) as usize]),
-            usage: BufferUsages::VERTEX| BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC
-        });
-
-        let color_bg = driver.device.create_bind_group(
-            &BindGroupDescriptor { 
-                label: None, 
-                layout: &color_bind_group_layout, 
-                entries: &[
-                    wgpu::BindGroupEntry{
-                        binding: 0,
-                        resource: color_buffer.as_entire_binding()
-                    }
-                ],
-            }
-        );
-        color_bg
-    }
-
-    fn create_collide_params_bg(driver: &Driver, dimensions_buffer: &wgpu::Buffer, omega: f32) -> (wgpu::BindGroupLayout ,wgpu::BindGroup){
-        
-        let collide_params_bind_group_layout =  
-            driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
-                { entries: &[
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(
-                                    (1 * mem::size_of::<f32>()) as _,
-                                ),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (2 * mem::size_of::<u32>()) as _,),
-                        },
-                        count: None,
-                    },
-                ],
-                label: None
-            });
-
-        let omega_buffer = driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor
-            {
-                label: Some("Omega"),
-                contents: bytemuck::bytes_of(&omega),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        
-        let collide_params_bind_group = driver.device.create_bind_group(
-            &wgpu::BindGroupDescriptor { 
-                label: Some("Collide Parameters"), 
-                layout: &collide_params_bind_group_layout, 
-                entries: &[
-                    wgpu::BindGroupEntry{
-                        binding: 0,
-                        resource: omega_buffer.as_entire_binding()
-                    },
-                    wgpu::BindGroupEntry{
-                        binding: 1, 
-                        resource: dimensions_buffer.as_entire_binding()
-                    }
-                ]}
-        );
-
-        (collide_params_bind_group_layout, collide_params_bind_group)
-    }
-
-    fn create_origin_output_bg(driver: &Driver) -> (wgpu::BindGroupLayout ,wgpu::BindGroup){
-        
-        let origin_output_bind_group_layout =  
-            driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
-                { entries: &[
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Storage { read_only: (false) },
-                                has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(
-                                    (X as usize * Y as usize * mem::size_of::<f32>()) as _,
-                                ),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Storage { read_only: (false) },
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (X as usize * Y as usize * mem::size_of::<f32>()) as _,),
-                        },
-                        count: None,
-                    },
-                ],
-                label: None
-            });
-        
-        let init_state = Self::set_equil(0.1, 0.0, 1.0);
-
-        let origin_buffer = driver.device.create_buffer_init(&BufferInitDescriptor { 
-            label: None, 
-            contents: bytemuck::cast_slice(&init_state[4]), 
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC
-        });
-
-        let output_buffer = driver.device.create_buffer_init(&BufferInitDescriptor { 
-            label: None, 
-            contents: bytemuck::cast_slice(&vec![0.0; X as usize * Y as usize]), 
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC
-        });
-
-        let origin_output_bind_group = driver.device.create_bind_group(
-            &wgpu::BindGroupDescriptor { 
-                label: Some("Collide Parameters"), 
-                layout: &origin_output_bind_group_layout, 
-                entries: &[
-                    wgpu::BindGroupEntry{
-                        binding: 0,
-                        resource: origin_buffer.as_entire_binding()
-                    },
-                    wgpu::BindGroupEntry{
-                        binding: 1, 
-                        resource: output_buffer.as_entire_binding(),
-                    }
-                ]}
-        );
-
-        (origin_output_bind_group_layout, origin_output_bind_group)
-    }
-
-    fn create_data_bgs(driver: &Driver) -> (wgpu::BindGroupLayout, Vec<wgpu::BindGroup>, Vec<wgpu::BindGroup>){
-        
-        let data_bind_group_layout = 
-            driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
-                { entries: &[
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { 
-                            ty: wgpu::BufferBindingType::Storage { read_only: false }, 
-                            has_dynamic_offset: false, 
-                            min_binding_size: wgpu::BufferSize::new(
-                                (X as usize * Y as usize * mem::size_of::<f32>()) as _,), 
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { 
-                            ty: wgpu::BufferBindingType::Storage { read_only: false }, 
-                            has_dynamic_offset: false, 
-                            min_binding_size: wgpu::BufferSize::new(
-                                (X as usize * Y as usize * mem::size_of::<f32>()) as _,), 
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { 
-                            ty: wgpu::BufferBindingType::Storage { read_only: false }, 
-                            has_dynamic_offset: false, 
-                            min_binding_size: wgpu::BufferSize::new(
-                                (X as usize * Y as usize * mem::size_of::<f32>()) as _,), 
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer { 
-                            ty: wgpu::BufferBindingType::Storage { read_only: false }, 
-                            has_dynamic_offset: false, 
-                            min_binding_size: wgpu::BufferSize::new(
-                                (X as usize * Y as usize * mem::size_of::<f32>()) as _,), 
-                        },
-                        count: None,
-                    },
-                ],
-                label: None,
-            });
-
-        let init_state = Self::set_equil(0.1, 0.0, 1.0);
-        
-        let mut odd_data_buffers = Vec::<wgpu::Buffer>::with_capacity(9);
-        let mut even_data_buffers = Vec::<wgpu::Buffer>::with_capacity(9);
-
-        let mut corner_bind_groups = Vec::<wgpu::BindGroup>::with_capacity(2);
-        let mut cardinal_bind_groups = Vec::<wgpu::BindGroup>::with_capacity(2);
-
-        for i in 0..9{
-            odd_data_buffers.push(
-                driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor
-                {
-                    label: Some(&format!("{}, Odd", Self::int_to_direction(i))),
-                    contents: bytemuck::cast_slice(&init_state[i]),
-                    usage: wgpu::BufferUsages::VERTEX
-                    | wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-                })
-            );
-
-            even_data_buffers.push(
-                driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor
-                    {
-                        label: Some(&format!("{}, Even", Self::int_to_direction(i))),
-                        contents: bytemuck::cast_slice(&init_state[i]),
-                        usage: wgpu::BufferUsages::VERTEX
-                        | wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | wgpu::BufferUsages::COPY_SRC,
-                    })
-            );
-        }
-        
-        corner_bind_groups.push(
-            driver.device.create_bind_group(
-                &wgpu::BindGroupDescriptor{
-                    layout: &data_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: odd_data_buffers[0].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: odd_data_buffers[2].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: odd_data_buffers[8].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: odd_data_buffers[6].as_entire_binding(),
-                        }
-                    ],
-                    label: Some("Odd corner binding")
-                } 
-            )    
-        );
-
-        corner_bind_groups.push(
-            driver.device.create_bind_group(
-                &wgpu::BindGroupDescriptor{
-                    layout: &data_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: even_data_buffers[0].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: even_data_buffers[2].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: even_data_buffers[8].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: even_data_buffers[6].as_entire_binding(),
-                        }
-                    ],
-                    label: Some("Even corner binding")
-                } 
-            )    
-        );
-
-        cardinal_bind_groups.push(
-            driver.device.create_bind_group(
-                &wgpu::BindGroupDescriptor{
-                    layout: &data_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: odd_data_buffers[1].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: odd_data_buffers[5].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: odd_data_buffers[7].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: odd_data_buffers[3].as_entire_binding(),
-                        }
-                    ],
-                    label: Some("Odd cardinal binding")
-                } 
-            )    
-        );
-
-        cardinal_bind_groups.push(
-            driver.device.create_bind_group(
-                &wgpu::BindGroupDescriptor{
-                    layout: &data_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: even_data_buffers[1].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: even_data_buffers[5].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: even_data_buffers[7].as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: even_data_buffers[3].as_entire_binding(),
-                        }
-                    ],
-                    label: Some("Even cardinal binding")
-                } 
-            )    
-        );
-
-        (data_bind_group_layout, corner_bind_groups, cardinal_bind_groups)
-
-    }
-
-    fn create_stream_params_bg(driver: &Driver, dimensions_buffer: &wgpu::Buffer, barrier_buffer: wgpu::Buffer) -> (wgpu::BindGroupLayout ,wgpu::BindGroup){
-
-        let stream_params_bind_group_layout = 
-            driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
-                { entries: &[
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(
-                                (2 * mem::size_of::<u32>()) as _,),
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry{
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer{
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                                has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(
-                                    (Y as usize * X as usize * mem::size_of::<bool>()) as _,
-                                ),
-                        },
-                        count: None,
-                    },
-                ],
-                label: None
-            });
-        
-        let stream_params_bind_group = driver.device.create_bind_group(
-            &wgpu::BindGroupDescriptor { 
-                label: Some("Stream Parameters"), 
-                layout: &stream_params_bind_group_layout, 
-                entries: &[
-                    wgpu::BindGroupEntry{
-                        binding: 0,
-                        resource: dimensions_buffer.as_entire_binding()
-                    },
-                    wgpu::BindGroupEntry{
-                        binding: 1,
-                        resource: barrier_buffer.as_entire_binding()
-                    }
-                ] 
-            }
-        );
-
-        (stream_params_bind_group_layout, stream_params_bind_group)
-
-    }
-
-    fn create_vertex_buffer(driver: &Driver) -> wgpu::Buffer{
-       driver.device.create_buffer_init(&BufferInitDescriptor{
-            label: None,
-            contents: bytemuck::cast_slice(&[-1.0, 1.0, -1.0, 1.0 - 2.0/Y as f32, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32, -1.0, 1.0, -1.0 + 2.0/X as f32, 1.0, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32]),
-            usage: BufferUsages::VERTEX
+            ]
         })
     }
 
-    fn create_collide_pipeline(driver: &Driver, 
-                               params: &wgpu::BindGroupLayout, 
-                               data: &wgpu::BindGroupLayout, 
-                               matrix: &wgpu::BindGroupLayout) 
-                               -> wgpu::ComputePipeline{
-
-        let collide_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/collide.wgsl"))),
-        });
-        
-        let collide_pipeline_layout = 
-            driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { 
-                label: Some("Collide"), 
-                bind_group_layouts: &[params, data, data, matrix], 
-                push_constant_ranges: &[]
-        });
-
-        driver.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
+    fn create_dimension_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
             label: None, 
-            layout: Some(&collide_pipeline_layout), 
-            module: &collide_shader, 
-            entry_point: "main" 
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((3 * mem::size_of::<u32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ] 
         })
     }
 
-    fn create_stream_layout(driver: &Driver, 
-                            params: &wgpu::BindGroupLayout, 
-                            data: &wgpu::BindGroupLayout)
-                            -> wgpu::PipelineLayout{
-        driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { 
-            label: Some("Stream"), 
-            bind_group_layouts: &[params, data, data], 
+    fn create_dimension_bg(device : &Device, bgl: &BindGroupLayout) -> wgpu::BindGroup{
+        let dimension_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(&[X, Y, X * Y]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: bgl, 
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: dimension_buffer.as_entire_binding(),
+                }
+            ]
+        })
+    }
+
+    fn create_vertex_dimension_bgl(device : &Device) -> wgpu::BindGroupLayout{
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
+            label: None, 
+            entries: &[
+                wgpu::BindGroupLayoutEntry{
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { 
+                        ty: wgpu::BufferBindingType::Uniform, 
+                        has_dynamic_offset: false, 
+                        min_binding_size: wgpu::BufferSize::new((3 * mem::size_of::<u32>()) as _,) 
+                    },
+                    count: None,
+                }
+            ] 
+        })
+    }
+
+    fn create_vertex_dimension_bg(device : &Device, bgl: &BindGroupLayout) -> wgpu::BindGroup{
+        
+        let dimension_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(&[X, Y, X * Y]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::VERTEX,
+        });
+
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: bgl, 
+            entries: &[
+                wgpu::BindGroupEntry{
+                    binding: 0,
+                    resource: dimension_buffer.as_entire_binding(),
+                }
+            ]
+        })
+    }
+
+    fn create_omega_buffer(device : &Device, omega: f32) -> wgpu::Buffer{
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::bytes_of(&omega),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        })
+    }
+
+    fn create_size_buffer(device : &Device) -> wgpu::Buffer{
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::bytes_of(&(X * Y)),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
+    }
+
+    fn create_pre_collision_pl(device : &Device, 
+                               data_pair: &wgpu::BindGroupLayout, 
+                               data_triple: &wgpu::BindGroupLayout,
+                               size: &wgpu::BindGroupLayout
+                            ) -> wgpu::PipelineLayout{
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
+            label: None, 
+            bind_group_layouts: &[data_pair, data_pair, data_triple, size], 
             push_constant_ranges: &[]
         })
     }
 
-    fn create_stream_corners_pipeline(driver: &Driver,
-                                      layout: &wgpu::PipelineLayout)
-                                      -> wgpu::ComputePipeline{
-        let stream_corners_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/stream_corners.wgsl"))),
-        });
-
-        driver.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
+    fn create_collision_pl(device : &Device,
+        data_pair: &wgpu::BindGroupLayout,
+        data_triple: &wgpu::BindGroupLayout,
+        collide_bgl: &wgpu::BindGroupLayout
+    ) -> wgpu::PipelineLayout{
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
             label: None, 
-            layout: Some(layout), 
-            module: &stream_corners_shader, 
-            entry_point: "main" 
+            bind_group_layouts: &[data_pair, data_pair, data_triple, collide_bgl], 
+            push_constant_ranges: &[] 
         })
     }
 
-    fn create_stream_cardinal_pipeline(driver: &Driver,
-                                      layout: &wgpu::PipelineLayout)
-                                      -> wgpu::ComputePipeline{
-        
-        let stream_cardinal_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/stream_cardinal.wgsl"))),
-        });
+    fn create_stream_pl(
+        device : &Device,
+        dimensions: &wgpu::BindGroupLayout,
+        data_pair: &wgpu::BindGroupLayout,
+        barrier: &wgpu::BindGroupLayout,
+    ) -> wgpu::PipelineLayout{
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
+            label: None, 
+            bind_group_layouts: &[dimensions, data_pair, data_pair, barrier], 
+            push_constant_ranges: &[] 
+        })
+    }
 
-        driver.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
+    fn create_summary_pl(
+        device : &Device,
+        dimensions: &wgpu::BindGroupLayout,
+        data_triple: &wgpu::BindGroupLayout,
+        data_single: &wgpu::BindGroupLayout,
+    ) -> wgpu::PipelineLayout{
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
+            label: None, 
+            bind_group_layouts: &[dimensions, data_triple, data_single], 
+            push_constant_ranges: &[]
+        })
+    }
+
+    fn create_color_map_pl(
+        device : &Device,
+        data_single: &wgpu::BindGroupLayout,
+        color: &wgpu::BindGroupLayout,
+        barrier: &wgpu::BindGroupLayout,
+        size: &wgpu::BindGroupLayout
+    ) -> wgpu::PipelineLayout{
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
+            label: None, 
+            bind_group_layouts: &[color, data_single, barrier, size], 
+            push_constant_ranges: &[] 
+        })
+    }
+
+    fn create_compute_pipeline(
+        device : &Device,
+        module: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout
+    ) -> wgpu::ComputePipeline{
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor{ 
             label: None, 
             layout: Some(layout), 
-            module: &stream_cardinal_shader, 
-            entry_point: "main" 
+            module: module, 
+            entry_point: "main"
         })
+    }
+
+    fn create_data_buffers(device : &Device, data: &Vec<Vec<f32>>) -> Vec<wgpu::Buffer>{
+        data.iter().map(|x| device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(&x),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        }))
+        .collect()
+    }
+
+    fn create_data_bg_from_buffers(device : &Device, 
+        buffers: &Vec<&wgpu::Buffer>,
+        data_bgl: &wgpu::BindGroupLayout) -> wgpu::BindGroup{
+        let mut data_entry = Vec::<wgpu::BindGroupEntry>::new();
+        for i in 0..buffers.len(){
+            data_entry.push(wgpu::BindGroupEntry{binding: i as u32, resource: buffers[i].as_entire_binding()})
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: data_bgl, 
+            entries: &data_entry
+        })
+    }
+
+    fn create_data_bg<const N:usize>(
+        device : &Device,
+        data: &[&Vec<f32>; N],
+        data_bgl: &wgpu::BindGroupLayout
+    ) -> wgpu::BindGroup{
+        let data:[wgpu::Buffer; N] = data
+            .iter()
+            .map(|x| device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+                label: None,
+                contents: bytemuck::cast_slice(&x),
+                usage: wgpu::BufferUsages::STORAGE,
+            }))
+            .collect::<Vec<wgpu::Buffer>>()
+            .try_into()
+            .unwrap();
+        let mut data_entry = vec![wgpu::BindGroupEntry{binding: 0 as u32, resource: data[0].as_entire_binding()}; N];
+        for i in 1..N{
+            data_entry[i] = wgpu::BindGroupEntry{binding: i as u32, resource: data[i].as_entire_binding()}
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: data_bgl, 
+            entries: &data_entry
+        })
+    }
+
+    fn create_barrier_buffer(
+        barrier: &Vec<u32>,
+        device : &Device,
+    ) -> wgpu::Buffer{ 
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(barrier),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    }
+
+    fn create_barrier_bg(
+        device : &Device,
+        barrier: &wgpu::Buffer,
+        data_single_bgl: &wgpu::BindGroupLayout,
+    ) -> wgpu::BindGroup{
+        device.create_bind_group(&wgpu::BindGroupDescriptor{ 
+            label: None, 
+            layout: data_single_bgl, 
+            entries: &[wgpu::BindGroupEntry{
+                binding: 0,
+                resource: barrier.as_entire_binding(),
+            }] 
+        })
+    }
+
+    fn init_barrier() -> Vec<u32>{
+        
+        let mut border_vec = vec![0_u32; X as usize * Y as usize];
+
+        for i in 0..X{
+            border_vec[Self::index(i, 0) as usize] = 1;
+            border_vec[Self::index(i, Y - 1) as usize] = 1;
+        }
+
+        border_vec
+    }
+
+    fn index(x: u32, y:u32) -> u32{
+        x + y * X
+    }
+
+    fn set_equil(mut ux: f32, mut uy: f32, rho: f32) -> Vec<Vec<f32>>{
+    
+        let mut ux_2 = ux * ux;
+        let mut uy_2 = uy * uy;
+        let mut u_dot_product = ux_2 + uy_2;
+        let mut u_sum_sq_pos = u_dot_product + 2.0 * (ux * uy);
+        let mut u_sum_sq_neg = u_dot_product - 2.0 * (ux * uy);
+    
+        ux *= 3.0;
+        uy *= 3.0;
+        ux_2 *= 4.5;
+        uy_2 *= 4.5;
+        u_dot_product *= 1.5;
+        u_sum_sq_neg *= 4.5;
+        u_sum_sq_pos *= 4.5;
+    
+        let rho_ninth = rho/9.0_f32;
+        let rho_36th = rho/36.0_f32;
+    
+        let mut vec = Vec::with_capacity(9);
+    
+        vec.push(vec![rho_36th * (1.0 - ux + uy + u_sum_sq_neg - u_dot_product); X as usize * Y as usize]);
+        vec.push(vec![rho_ninth * (1.0 + uy + uy_2 - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_36th * (1.0 + ux + uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_ninth * (1.0 - ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![4.0 * rho_ninth * (1.0 - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_ninth * (1.0 + ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_36th * (1.0 - ux - uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_ninth * (1.0 - uy - uy_2 - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_36th * (1.0 + ux - uy + u_sum_sq_neg - u_dot_product);  X as usize * Y as usize]);
+        vec
+        
     }
 
     fn create_render_pipeline(driver: &Driver,
                               colors: &BindGroupLayout,
-                              stream_params: &BindGroupLayout
+                              dimension_params: &BindGroupLayout
                             ) -> wgpu::RenderPipeline{
 
         let render_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/render.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/render.wgsl"))),
         });
 
         let render_pipeline_layout = driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&colors, &stream_params],
+            bind_group_layouts: &[&colors, &dimension_params],
             push_constant_ranges: &[],
         });
 
@@ -590,147 +678,429 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
         })
     }
 
-    fn create_curl_pipeline(driver: &Driver, 
-        params: &wgpu::BindGroupLayout, 
-        data: &wgpu::BindGroupLayout, 
-        origin_output: &wgpu::BindGroupLayout) 
-        -> wgpu::ComputePipeline{
-
-        let curl_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/curl.wgsl"))),
-        });
-
-        let curl_pipeline_layout = 
-            driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { 
-            label: Some("Collide"), 
-            bind_group_layouts: &[params, data, data, origin_output], 
-            push_constant_ranges: &[]
-        });
-
-        driver.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
-            label: None, 
-            layout: Some(&curl_pipeline_layout), 
-            module: &curl_shader, 
-            entry_point: "main" 
-        })
-    }
-
-    fn create_color_pipeline(driver: &Driver, 
-        color: &wgpu::BindGroupLayout,  
-        origin_output: &wgpu::BindGroupLayout) 
-        -> wgpu::ComputePipeline{
-
-        let color_shader = driver.device.create_shader_module(wgpu::ShaderModuleDescriptor{
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/color_map.wgsl"))),
-        });
-
-        let color_pipeline_layout = 
-            driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { 
-            label: Some("Color"), 
-            bind_group_layouts: &[color, origin_output], 
-            push_constant_ranges: &[]
-        });
-
-        driver.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { 
-            label: None, 
-            layout: Some(&color_pipeline_layout), 
-            module: &color_shader, 
-            entry_point: "main" 
-        })
-    }
-
-
-    pub async fn new(driver: &Driver, omega: f32) -> Simulation<X,Y>{
-        
-        //create common resources
-        let barriers = Self::init_barrier(&driver.device);
-
-        let dimensions_buffer = driver.device.create_buffer_init(&BufferInitDescriptor{
-            label: None,
-            contents: bytemuck::cast_slice(&[X,Y]),
-            usage: BufferUsages::COPY_DST| BufferUsages::UNIFORM
-        });
-
-        let matrix_bind_group_layout = driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { 
+    fn create_barrier_update_bgl(driver: &Driver) -> wgpu::BindGroupLayout{
+        driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
             label: None, 
             entries: &[
-                wgpu::BindGroupLayoutEntry{
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer{
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new((mem::size_of::<f32>() * X as usize * Y as usize) as _,),
-                    },
-                    count: None,
+            wgpu::BindGroupLayoutEntry{
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer{ 
+                    ty: wgpu::BufferBindingType::Uniform, 
+                    has_dynamic_offset: false, 
+                    min_binding_size: wgpu::BufferSize::new((1 * mem::size_of::<u32>()) as _,)
                 },
-            ],
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry{
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer{ 
+                    ty: wgpu::BufferBindingType::Storage { read_only: true }, 
+                    has_dynamic_offset: false, 
+                    min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<u32>()) as _,)
+                },
+                count: None,
+            }
+            ]
+        })
+    }
+
+    fn create_barrier_update_pl(driver: &Driver, 
+        update_bgl: &wgpu::BindGroupLayout, 
+        barrier_bgl: &wgpu::BindGroupLayout) -> wgpu::PipelineLayout{
+        driver.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor{ 
+            label: None, 
+            bind_group_layouts: &[update_bgl, barrier_bgl], 
+            push_constant_ranges: &[]
+        })
+    }
+
+    pub fn new(driver: &Driver, omega: f32) -> LBM<X, Y>{
+        
+        //Create Bindgroup Layouts
+        let data_single_bgl = Self::create_data_single_bgl(&driver.device);
+        let data_pair_bgl = Self::create_data_pair_bgl(&driver.device);
+        let data_triple_bgl = Self::create_data_triple_bgl(&driver.device);
+        let collide_bgl = Self::create_collide_bgl(&driver.device);
+        let color_bgl = Self::create_color_bgl(&driver.device);
+        let size_bgl = Self::create_size_bgl(&driver.device);
+        let dimension_bgl = Self::create_dimension_bgl(&driver.device);
+        let dimension_vertex_bgl = Self::create_vertex_dimension_bgl(&driver.device);
+        let barrier_bgl = Self::create_barrier_bgl(&driver.device);
+
+        //Create Initial Conditions
+        let init_data = Self::set_equil(0.1, 0.0, 1.0);
+        let mut data_buffers = Vec::<Vec<wgpu::Buffer>>::new();
+        
+        for _ in 0..2{
+            data_buffers.push(Self::create_data_buffers(&driver.device, &init_data));
+        }
+
+        //Create Needed Buffers
+        let barrier_vec = Self::init_barrier();
+        let barrier_buffer = Self::create_barrier_buffer(&barrier_vec, &driver.device);
+        let omega_buffer = Self::create_omega_buffer(&driver.device , omega);
+        let size_buffer = Self::create_size_buffer(&driver.device);
+
+        //Create Bindgroups
+        let mut ne_sw_bgs = Vec::<wgpu::BindGroup>::with_capacity(2);
+        let mut nw_se_bgs = Vec::<wgpu::BindGroup>::with_capacity(2);
+        let mut n_s_bgs = Vec::<wgpu::BindGroup>::with_capacity(2);
+        let mut e_w_bgs = Vec::<wgpu::BindGroup>::with_capacity(2);
+
+        for i in 0..2{
+            ne_sw_bgs.push(Self::create_data_bg_from_buffers(&driver.device, 
+                &vec![&data_buffers[i][2], &data_buffers[i][6]], 
+            &data_pair_bgl));
+            nw_se_bgs.push(Self::create_data_bg_from_buffers(&driver.device, 
+            &vec![&data_buffers[i][0], &data_buffers[i][8]], 
+        &data_pair_bgl));
+            n_s_bgs.push(Self::create_data_bg_from_buffers(&driver.device, 
+            &vec![&data_buffers[i][1], &data_buffers[i][7]], 
+        &data_pair_bgl));
+            e_w_bgs.push(Self::create_data_bg_from_buffers(&driver.device, 
+            &vec![&data_buffers[i][5], &data_buffers[i][3]], 
+            &data_pair_bgl));
+        }
+
+        let zero_vec = vec![0.0; X as usize * Y as usize];
+        let collide_bg = Self::create_collide_bg(&driver.device, &data_buffers[0][4], 
+            &omega_buffer, 
+            &size_buffer,
+            &collide_bgl);
+        let density_bg = Self::create_data_bg(&driver.device, 
+            &[&zero_vec, &zero_vec, &zero_vec], 
+            &data_triple_bgl);
+        let output_bg = Self::create_data_bg(&driver.device, 
+            &[&zero_vec], 
+            &data_single_bgl);
+        let color_bg = Self::create_color_bg(&driver.device, &color_bgl);
+        let size_bg = Self::create_size_bg(&driver.device, &size_buffer, &size_bgl);
+        let dimension_bg = Self::create_dimension_bg(&driver.device, &dimension_bgl);
+        let vertex_dimension_bg = Self::create_vertex_dimension_bg(&driver.device, &dimension_vertex_bgl);
+        let barrier_bg = Self::create_barrier_bg(&driver.device, 
+            &barrier_buffer, 
+            &barrier_bgl);
+
+        //Create Pipeline Layouts
+        let pre_collision_pl = Self::create_pre_collision_pl(&driver.device, 
+            &data_pair_bgl, 
+            &data_triple_bgl, 
+            &size_bgl);
+
+        let collision_pl = Self::create_collision_pl(&driver.device, 
+            &data_pair_bgl, 
+            &data_triple_bgl, 
+            &collide_bgl);
+
+        let stream_pl = Self::create_stream_pl(&driver.device, 
+            &dimension_bgl, 
+            &data_pair_bgl, 
+            &barrier_bgl);
+
+        let summary_pl = Self::create_summary_pl(&driver.device, 
+            &dimension_bgl, 
+            &data_triple_bgl, 
+            &data_single_bgl);
+
+        let color_map_pl = Self::create_color_map_pl(&driver.device,
+            &data_single_bgl,
+            &color_bgl,
+            &barrier_bgl,
+            &size_bgl
+        );
+
+        //Create all shader modules
+        let corner_pre_collision_s = driver.device.create_shader_module(ShaderModuleDescriptor{
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/pre_collision/corner_pre_collision.wgsl")))
         });
 
-        //create all bindgroups and layouts
-        let dimensions_tuple = Self::create_dimensions_bg(driver, &dimensions_buffer);
-        let color_bg = Self::create_color_bg(driver, &matrix_bind_group_layout);
-        let collide_tuple = Self::create_collide_params_bg(driver, &dimensions_buffer, omega);
-        let stream_params_tuple = Self::create_stream_params_bg(driver, &dimensions_buffer, barriers);
-        let data_tuple = Self::create_data_bgs(driver);
-        let origin_output_tuple = Self::create_origin_output_bg(driver);
+        let cardinal_pre_collision_s = driver.device.create_shader_module(ShaderModuleDescriptor{
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/pre_collision/cardinal_pre_collision.wgsl")))
+        });
 
-        //create vertex buffer
+        let cardinal_collision_s = driver.device.create_shader_module(ShaderModuleDescriptor{
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/collision/cardinal_collision.wgsl")))
+        });
+
+        let corner_collision_s = driver.device.create_shader_module(ShaderModuleDescriptor{
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/collision/corner_collision.wgsl")))
+        });
+
+        let ne_sw_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/stream/ne_sw_stream.wgsl")))
+        });
+
+        let nw_se_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/stream/se_nw_stream.wgsl")))
+        });
+
+        let n_s_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/stream/n_s_stream.wgsl")))
+        });
+
+        let e_w_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/stream/e_w_stream.wgsl")))
+        });
+
+        let ux_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/summary_stats/ux.wgsl")))
+        });
+
+        let uy_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/summary_stats/uy.wgsl")))
+        });
+
+        let rho_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/summary_stats/rho.wgsl")))
+        });
+
+        let curl_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/summary_stats/curl.wgsl")))
+        });
+
+        let inferno_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/color_map/inferno.wgsl")))
+        });
+
+        let viridis_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/color_map/viridis.wgsl")))
+        });
+
+        let jet_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/color_map/jet.wgsl")))
+        });
+
+        let corner_pre_collision = Self::create_compute_pipeline(&driver.device, 
+            &corner_pre_collision_s, 
+            &pre_collision_pl);
+        let cardinal_pre_collision = Self::create_compute_pipeline(&driver.device, 
+            &cardinal_pre_collision_s, 
+            &pre_collision_pl);
+        
+        let corner_collision = Self::create_compute_pipeline(&driver.device, 
+            &corner_collision_s, 
+            &collision_pl);
+        let cardinal_collision = Self::create_compute_pipeline(&driver.device, 
+            &cardinal_collision_s, 
+            &collision_pl);
+        
+        let e_w_stream = Self::create_compute_pipeline(&driver.device, 
+            &e_w_s, 
+            &stream_pl);
+        let n_s_stream = Self::create_compute_pipeline(&driver.device, 
+            &n_s_s, 
+            &stream_pl);
+        let ne_sw_stream = Self::create_compute_pipeline(&driver.device, 
+            &ne_sw_s, 
+            &stream_pl);
+        let nw_se_stream = Self::create_compute_pipeline(&driver.device, 
+            &nw_se_s, 
+            &stream_pl);
+
+        let curl = Self::create_compute_pipeline(&driver.device, 
+            &curl_s, 
+            &summary_pl);
+        
+        let ux = Self::create_compute_pipeline(&driver.device, 
+            &ux_s, 
+            &summary_pl);
+
+        let uy = Self::create_compute_pipeline(&driver.device, 
+            &uy_s, 
+            &summary_pl);
+
+        let rho = Self::create_compute_pipeline(&driver.device, 
+            &rho_s, 
+            &summary_pl);
+
+        let viridis = Self::create_compute_pipeline(&driver.device, 
+            &viridis_s, 
+            &color_map_pl);
+
+        let inferno = Self::create_compute_pipeline(&driver.device, 
+            &inferno_s, 
+            &color_map_pl);
+
+        let jet = Self::create_compute_pipeline(&driver.device, 
+            &jet_s, 
+            &color_map_pl);
+
+        let render = Self::create_render_pipeline(&driver, 
+            &color_bgl, 
+            &dimension_vertex_bgl);
+
         let vertex_buffer = Self::create_vertex_buffer(driver);
 
-        //create pipelines
-        let collide_pipeline = Self::create_collide_pipeline(driver, &collide_tuple.0, &data_tuple.0, &origin_output_tuple.0);
-        let stream_pipeline_layout = Self::create_stream_layout(driver, &stream_params_tuple.0, &data_tuple.0);
-        let stream_corner_pipeline = Self::create_stream_corners_pipeline(driver, &stream_pipeline_layout);
-        let stream_cardinal_pipeline = Self::create_stream_cardinal_pipeline(driver, &stream_pipeline_layout);
-        let render_pipeline = Self::create_render_pipeline(driver, &matrix_bind_group_layout, &stream_params_tuple.0);
-        let color_pipeline = Self::create_color_pipeline(driver, &matrix_bind_group_layout, &origin_output_tuple.0);
-        let curl_pipeline = Self::create_curl_pipeline(driver, &dimensions_tuple.0, &data_tuple.0, &origin_output_tuple.0);
+        let draw_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
+            label: None, 
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/update_barrier/barrier_draw.wgsl")))
+        });
 
-        Simulation{
-            dimension_bind_group: dimensions_tuple.1,
-            color_bind_group: color_bg,
-            corner_bind_groups: data_tuple.1,
-            cardinal_bind_groups: data_tuple.2,
-            collide_params_bind_group: collide_tuple.1,
-            origin_output_bind_group: origin_output_tuple.1,
-            stream_params_bind_group: stream_params_tuple.1,
+        let barrier_update_bgl = Self::create_barrier_update_bgl(driver);
+
+        let barrier_update_pl = Self::create_barrier_update_pl(driver, &barrier_update_bgl, &barrier_bgl);
+
+        let barrier_draw = Self::create_compute_pipeline(&driver.device, &draw_s, &barrier_update_pl);
+
+        let draw_points = driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::cast_slice(&vec![0 as u32;2 * X as usize * Y as usize]),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+
+        let draw_num = driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
+            label: None,
+            contents: bytemuck::bytes_of(&0),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let draw_bg = driver.device.create_bind_group(&BindGroupDescriptor{
+            label: None,
+            layout: &barrier_update_bgl,
+            entries: &[BindGroupEntry{
+                binding: 0,
+                resource: draw_num.as_entire_binding(),
+            },
+            BindGroupEntry{
+                binding: 1,
+                resource: draw_points.as_entire_binding(),
+            }]
+        });
+
+        LBM { 
+            collide_bg, 
+            output_bg, 
+            density_bg, 
+            dimension_bg, 
+            dimension_bg_vertex: vertex_dimension_bg, 
+            barrier_bg, 
+            ne_sw_bgs, 
+            nw_se_bgs, 
+            n_s_bgs, 
+            e_w_bgs, 
+            barrier_buffer, 
+            omega_buffer, 
+            e_w_stream, 
+            n_s_stream, 
+            ne_sw_stream, 
+            nw_se_stream, 
+            curl, 
+            ux, 
+            uy, 
+            color_map: ColorMap::Jet, 
+            render,
+            cardinal_pre_collision,
+            corner_pre_collision,
+            corner_collide: corner_collision,
+            cardinal_collide: cardinal_collision,
+            compute_step: 0,
+            frame_number: 0,
+            work_group_size: Self::calculate_work_group_size(),
+            size_bg,
+            color_bg,
             vertex_buffer,
-            collide_pipeline,
-            stream_corner_pipeline,
-            stream_cardinal_pipeline,
-            render_pipeline,
-            color_pipeline,
-            curl_pipeline,
-            compute_num: 0,
-            frame_num: 0,
-            work_group_count: Self::calculate_work_group_count(),
+            summary_stat: SummaryStat::Curl,
+            barrier_draw,
+            draw_bg,
+            draw_num,
+            draw_points,
+            viridis,
+            jet,
+            inferno,
+            rho,
+            submitting: true,
+            data_buffers,
         }
+    }
+
+    fn calculate_summary(&mut self, encoder: &mut CommandEncoder){
+        match self.summary_stat {
+            SummaryStat::Curl => self.curl(encoder),
+            SummaryStat::Rho => self.rho(encoder),
+            SummaryStat::Ux => self.ux( encoder),
+            SummaryStat::Uy => self.uy(encoder),
+        }
+    }
+
+    pub fn set_summary(&mut self, stat: SummaryStat){
+        self.summary_stat = stat
     }
 
     pub fn iterate(&mut self, driver: &Driver, compute_steps: usize){
-        for _ in 0..compute_steps{
-            let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            self.compute_step( &mut encoder);
-            driver.queue.submit(Some(encoder.finish()));
+        for i in 0..compute_steps{
+            self.compute_step(driver);
         }
         let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        self.curl(&mut encoder);
+        self.calculate_summary(&mut encoder);
         self.color_map(&mut encoder);
         driver.queue.submit(Some(encoder.finish()));
         self.render(driver);
     }
 
-    fn compute_step(&mut self, encoder: &mut CommandEncoder){
-        self.collide(encoder);
-        self.stream_cardinal(encoder);
-        self.stream_corner(encoder);
-        self.compute_num += 1;
+    pub fn reset_to_equilibrium(&mut self, driver : &Driver){
+        let equilibrium_state = Self::set_equil(0.1, 0.0, 1.0);
+        for i in 0..9{
+            driver.queue.write_buffer(&self.data_buffers[0][i], 0, bytemuck::cast_slice(&equilibrium_state[i]));
+            driver.queue.write_buffer(&self.data_buffers[1][i], 0, bytemuck::cast_slice(&equilibrium_state[i]));
+        }
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.compute_step = 0;
+        self.frame_number = 0;
+        self.pre_collide_corner(&mut encoder);
+        self.pre_collide_cardinal(&mut encoder);
+        driver.queue.submit(Some(encoder.finish()));
     }
 
-    fn render(&mut self, driver: &Driver) {
+    pub fn rerender(&mut self, driver: &Driver){
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.calculate_summary(&mut encoder);
+        self.color_map(&mut encoder);
+        driver.queue.submit(Some(encoder.finish()));
+        self.render(driver);
+    }
+
+    fn compute_step(&mut self, driver: &Driver){
+        self.collide(driver);
+        self.stream(driver);
+        self.compute_step += 1;
+    }
+
+    pub fn collide(&mut self, driver: &Driver){
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.pre_collide_corner(&mut encoder);
+        self.pre_collide_cardinal(&mut encoder);
+        self.collide_corner(&mut encoder);
+        self.collide_cardinal(&mut encoder);
+        driver.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn stream(&mut self, driver: &Driver){
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        self.stream_e_w(&mut encoder);
+        self.stream_n_s(&mut encoder);
+        self.stream_nw_se(&mut encoder);
+        self.stream_ne_sw(&mut encoder);
+        driver.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn render(&mut self, driver: &Driver) {
         let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let frame = driver.surface
                     .get_current_texture()
@@ -749,154 +1119,202 @@ impl<const X:u32, const Y:u32> Simulation<X, Y>{
                 })],
                 depth_stencil_attachment: None,
             });
-            rpass.set_pipeline(&self.render_pipeline);
+            rpass.set_pipeline(&self.render);
             rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            rpass.set_bind_group(0, &self.color_bind_group, &[]);
-            rpass.set_bind_group(1, &self.stream_params_bind_group, &[]);
+            rpass.set_bind_group(0, &self.color_bg, &[]);
+            rpass.set_bind_group(1, &self.dimension_bg_vertex, &[]);
             rpass.draw(0..6, 0..X*Y);
         }
         driver.queue.submit(Some(encoder.finish()));
         frame.present();
-        self.frame_num += 1;
+        self.frame_number += 1;
     }
 
-
-    fn collide(&mut self, encoder: &mut CommandEncoder){
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&self.collide_pipeline);
-        cpass.set_bind_group(0, &self.collide_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[self.compute_num % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[self.compute_num % 2], &[]);
-        cpass.set_bind_group(3, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
-    }
-
-    fn stream_cardinal(&mut self,  encoder: &mut CommandEncoder){
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&self.stream_cardinal_pipeline);
-        cpass.set_bind_group(0, &self.stream_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.cardinal_bind_groups[self.compute_num % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.compute_num + 1) % 2], &[]);
-        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
+    pub fn get_frame_num(&self) -> usize{
+        self.frame_number
     }
     
-    fn stream_corner(&mut self, encoder: &mut CommandEncoder){
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&self.stream_corner_pipeline);
-        cpass.set_bind_group(0, &self.stream_params_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[self.compute_num % 2], &[]);
-        cpass.set_bind_group(2, &self.corner_bind_groups[(self.compute_num + 1) % 2], &[]);
-        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
+    pub fn get_compute_num(&self) -> usize{
+        self.compute_step
+    }
+
+    fn pre_collide_corner(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Precollision-corner") });
+        cpass.set_pipeline(&self.corner_pre_collision);
+        cpass.set_bind_group(0, &self.ne_sw_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(1, &self.nw_se_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.density_bg, &[]);
+        cpass.set_bind_group(3, &self.size_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn pre_collide_cardinal(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Precollision-cardinal") });
+        cpass.set_pipeline(&self.cardinal_pre_collision);
+        cpass.set_bind_group(0, &self.n_s_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(1, &self.e_w_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.density_bg, &[]);
+        cpass.set_bind_group(3, &self.size_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn collide_corner(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Collision-corner") });
+        cpass.set_pipeline(&self.corner_collide);
+        cpass.set_bind_group(0, &self.ne_sw_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(1, &self.nw_se_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.density_bg, &[]);
+        cpass.set_bind_group(3, &self.collide_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn collide_cardinal(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Collision-cardinal") });
+        cpass.set_pipeline(&self.cardinal_collide);
+        cpass.set_bind_group(0, &self.n_s_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(1, &self.e_w_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.density_bg, &[]);
+        cpass.set_bind_group(3, &self.collide_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn stream_nw_se(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Stream_nw_se") });
+        cpass.set_pipeline(&self.nw_se_stream);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.nw_se_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.nw_se_bgs[(self.compute_step + 1) % 2], &[]);
+        cpass.set_bind_group(3, &self.barrier_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn stream_ne_sw(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Stream_ne_sw") });
+        cpass.set_pipeline(&self.ne_sw_stream);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.ne_sw_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.ne_sw_bgs[(self.compute_step + 1) % 2], &[]);
+        cpass.set_bind_group(3, &self.barrier_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn stream_n_s(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Stream_n_s") });
+        cpass.set_pipeline(&self.n_s_stream);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.n_s_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.n_s_bgs[(self.compute_step + 1) % 2], &[]);
+        cpass.set_bind_group(3, &self.barrier_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    fn stream_e_w(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Stream_e_w") });
+        cpass.set_pipeline(&self.e_w_stream);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.e_w_bgs[self.compute_step % 2], &[]);
+        cpass.set_bind_group(2, &self.e_w_bgs[(self.compute_step + 1) % 2], &[]);
+        cpass.set_bind_group(3, &self.barrier_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
     fn curl(&mut self, encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&self.curl_pipeline);
-        cpass.set_bind_group(0, &self.dimension_bind_group, &[]);
-        cpass.set_bind_group(1, &self.corner_bind_groups[(self.compute_num + 1) % 2], &[]);
-        cpass.set_bind_group(2, &self.cardinal_bind_groups[(self.compute_num + 1) % 2], &[]);
-        cpass.set_bind_group(3, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
+        cpass.set_pipeline(&self.curl);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.density_bg, &[]);
+        cpass.set_bind_group(2, &self.output_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
-    fn color_map(&mut self,  encoder: &mut CommandEncoder){
+    fn ux(&mut self, encoder: &mut CommandEncoder){
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
-        cpass.set_pipeline(&self.color_pipeline);
-        cpass.set_bind_group(0, &self.color_bind_group, &[]);
-        cpass.set_bind_group(1, &self.origin_output_bind_group, &[]);
-        cpass.dispatch_workgroups(self.work_group_count as u32, 1, 1);
+        cpass.set_pipeline(&self.ux);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.density_bg, &[]);
+        cpass.set_bind_group(2, &self.output_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
-    fn set_equil(mut ux: f32, mut uy: f32, rho: f32) -> Vec<Vec<f32>>{
-    
-        let mut ux_2 = ux * ux;
-        let mut uy_2 = uy * uy;
-        let mut u_dot_product = ux_2 + uy_2;
-        let mut u_sum_sq_pos = u_dot_product + 2.0 * (ux * uy);
-        let mut u_sum_sq_neg = u_dot_product - 2.0 * (ux * uy);
-    
-        ux *= 3.0;
-        uy *= 3.0;
-        ux_2 *= 4.5;
-        uy_2 *= 4.5;
-        u_dot_product *= 1.5;
-        u_sum_sq_neg *= 4.5;
-        u_sum_sq_pos *= 4.5;
-    
-        let rho_ninth = rho/9.0_f32;
-        let rho_36th = rho/36.0_f32;
-    
-        let mut vec = Vec::with_capacity(9);
-    
-        vec.push(vec![rho_36th * (1.0 - ux + uy + u_sum_sq_neg - u_dot_product); X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 + uy + uy_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 + ux + uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 - ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
-        // below changed
-        vec.push(vec![4.0 * rho_ninth * (1.0 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 + ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 - ux - uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 - uy - uy_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 + ux - uy + u_sum_sq_neg - u_dot_product);  X as usize * Y as usize]);
-        vec
-        
+    fn uy(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.uy);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.density_bg, &[]);
+        cpass.set_bind_group(2, &self.output_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
-    fn int_to_direction(i:usize) -> &'static str{
-        match i {
-            0 => return "Northwest",
-            1 => return "North",
-            2 => return "Northeast",
-            3 => return "West",
-            4 => return "Origin",
-            5 => return "East",
-            6 => return "Southwest",
-            7 => return "South",
-            8 => return "Southeast",
-            _ => return "Out of bounds"
+    fn rho(&mut self, encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.rho);
+        cpass.set_bind_group(0, &self.dimension_bg, &[]);
+        cpass.set_bind_group(1, &self.density_bg, &[]);
+        cpass.set_bind_group(2, &self.output_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    pub fn color_map(&mut self,  encoder: &mut CommandEncoder){
+        match self.color_map {
+            ColorMap::Inferno => self.inferno_map(encoder),
+            ColorMap::Viridis => self.viridis_map(encoder),
+            ColorMap::Jet => self.jet_map(encoder),
         }
     }
 
-    fn init_barrier(device: &wgpu::Device) -> wgpu::Buffer{
-        
-        let mut border_vec = vec![0_u32; X as usize * Y as usize];
-
-        for i in 0..X{
-            border_vec[Self::index(i, 0) as usize] = 1;
-            border_vec[Self::index(i, Y - 1) as usize] =1;
-        }
-
-        let lines:Vec<Box<dyn Shape>> = vec![
-                                        Box::new(line::new((100,1),(100,400), X as isize, Y as isize).unwrap()),
-                                        Box::new(line::new((101,1),(101,400), X as isize, Y as isize).unwrap()),
-
-                                        Box::new(line::new((100,1023),(100,624), X as isize, Y as isize).unwrap()),
-                                        Box::new(line::new((101,1023),(101,624), X as isize, Y as isize).unwrap()),
-
-                                        Box::new(line::new((150, 512), (300, 400), X as isize, Y as isize).unwrap()),
-                                        Box::new(line::new((151, 512), (301, 400), X as isize, Y as isize).unwrap()),
-
-                                        Box::new(line::new((150, 512), (300, 624), X as isize, Y as isize).unwrap()),
-                                        Box::new(line::new((151, 512), (301, 624), X as isize, Y as isize).unwrap()),
-                                    ];
-
-        for i in merge(lines, X as usize){
-            border_vec[i] = 1;
-        }
-
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor
-            {
-                label: Some("Border"),
-                contents: bytemuck::cast_slice(&border_vec),
-                usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            })
+    fn viridis_map(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.viridis);
+        cpass.set_bind_group(0, &self.color_bg, &[]);
+        cpass.set_bind_group(1, &self.output_bg, &[]);
+        cpass.set_bind_group(2, &self.barrier_bg, &[]);
+        cpass.set_bind_group(3, &self.size_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
-    fn index(x: u32, y:u32) -> u32{
-        x + y * X
+    fn jet_map(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.jet);
+        cpass.set_bind_group(0, &self.color_bg, &[]);
+        cpass.set_bind_group(1, &self.output_bg, &[]);
+        cpass.set_bind_group(2, &self.barrier_bg, &[]);
+        cpass.set_bind_group(3, &self.size_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
     }
 
+    fn inferno_map(&mut self,  encoder: &mut CommandEncoder){
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.inferno);
+        cpass.set_bind_group(0, &self.color_bg, &[]);
+        cpass.set_bind_group(1, &self.output_bg, &[]);
+        cpass.set_bind_group(2, &self.barrier_bg, &[]);
+        cpass.set_bind_group(3, &self.size_bg, &[]);
+        cpass.dispatch_workgroups(self.work_group_size as u32, 1, 1);
+    }
+
+    pub fn draw_shape(&mut self, driver : &Driver, shape: &dyn Shape){
+        self.draw_barrier_updates(driver, get_points_vector(shape, X as usize))
+    }
+
+    fn draw_barrier_updates(&mut self,  driver : &Driver, points : Vec<u32>){
+
+        driver.queue.write_buffer(&self.draw_points, 0, bytemuck::cast_slice(&points));
+        driver.queue.write_buffer(&self.draw_num, 0, bytemuck::bytes_of(&(points.len() as u32)));
+        driver.queue.submit(None);
+
+        let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
+        cpass.set_pipeline(&self.barrier_draw);
+        cpass.set_bind_group(0, &self.draw_bg, &[]);
+        cpass.set_bind_group(1, &self.barrier_bg, &[]);
+        let work_groups = (points.len() as f32/256.0).ceil() as u32;
+        cpass.dispatch_workgroups(work_groups, 1, 1);
+        }
+        driver.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn update_omega_buffer(&mut self,  driver : &Driver, omega: f32){
+        driver.queue.write_buffer(&self.omega_buffer, 0, bytemuck::bytes_of(&omega));
+    }
 }
