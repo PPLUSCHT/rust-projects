@@ -5,7 +5,7 @@
   </head>
   <body>
     <script type="module">
-      import init, {run, WASMInteraction, SummaryStat, ColorMap} from "/pkg/lbm_web_gpu.js";
+      import init, {run, WASMInteraction, SummaryStat, ColorMap, ClickType} from "/pkg/lbm_web_gpu.js";
       init().then(() => {
         run();
       });
@@ -41,11 +41,36 @@
         WASMInteraction.set_color_map(ColorMap.Jet);
       }
 
+      function setInactive(){
+        WASMInteraction.set_draw_type(ClickType.Inactive);
+      }
+
+      function setDraw(){
+        WASMInteraction.set_draw_type(ClickType.Draw);
+      }
+
+      function setErase(){
+        WASMInteraction.set_draw_type(ClickType.Erase);
+      }
+
+      function setLine(){
+        WASMInteraction.set_draw_type(ClickType.Line);
+      }
+
+      function undo(){
+        WASMInteraction.undo();
+      }
+
       const curl = document.getElementById("curl-button");
       const Ux = document.getElementById("Ux-button");
       const Uy = document.getElementById("Uy-button");
       const Rho = document.getElementById("Rho-button");
       const Equilibrium = document.getElementById("Equilibrium");
+
+      const inactive = document.getElementById("Inactive");
+      const erase = document.getElementById("Erase");
+      const draw = document.getElementById("Draw");
+      const line = document.getElementById("Line");
 
       const viridis = document.getElementById("Viridis");
       const inferno = document.getElementById("Inferno");
@@ -54,11 +79,18 @@
       const pause = document.getElementById("Pause");
       const slider = document.getElementById("ComputeRatio");
       const viscosity_slider = document.getElementById("Viscosity");
+      const undo_b = document.getElementById("undo");
 
       curl.addEventListener("click", setCurl);
       Ux.addEventListener("click", setUX);
       Uy.addEventListener("click", setUY);
       Rho.addEventListener("click", setRho);
+
+      inactive.addEventListener("click", setInactive);
+      erase.addEventListener("click", setErase);
+      draw.addEventListener("click", setDraw);
+      line.addEventListener("click", setLine);
+      undo_b.addEventListener("click", undo);
 
       Equilibrium.addEventListener("click", setEquilibrium);
 
@@ -68,7 +100,8 @@
 
       pause.addEventListener("click", WASMInteraction.toggle_pause);
       slider.onchange = function() {
-        WASMInteraction.update_compute_rate(this.value);
+        console.log(this.value);
+        WASMInteraction.update_compute_rate(Math.floor(this.value));
       }
       viscosity_slider.onchange = function(){
         WASMInteraction.update_viscosity(this.value);
@@ -80,13 +113,19 @@
       <button id="Uy-button">Uy</button>
       <button id="Rho-button">Rho</button>
 
+      <button id="Inactive">Inactive</button>
+      <button id="Draw">Draw</button>
+      <button id="Erase">Erase</button>
+      <button id="Line">Line</button>
+
       <button id="Viridis">Viridis</button>
       <button id="Inferno">Inferno</button>
       <button id="Equilibrium">Equilibrium</button>
       <button id="Jet">Jet</button>
 
+      <button id="undo">Undo</button>
       <button id="Pause">Pause</button>
-      <input type="range" min="1" max="100" value="50" class="slider" id="ComputeRatio">
+      <input type="range" min="1" max="30" value="15" class="slider" id="ComputeRatio">
       <input type="range" min="0.005" max="0.5" value="0.1" class="slider" id="Viscosity" step="0.01">
     </div>
 

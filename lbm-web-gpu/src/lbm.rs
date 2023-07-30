@@ -5,7 +5,7 @@ use barrier_shapes::line::Line as line;
 
 use wgpu::{Device, BindGroupEntry, util::DeviceExt, BindGroupLayout, ShaderModuleDescriptor, vertex_attr_array, VertexBufferLayout};
 
-use crate::{driver::Driver, barrier_shapes::{Shape, merge_shapes::{merge, get_points_vector}, self, Point}};
+use crate::{driver::Driver, barrier_shapes::{Shape, merge_shapes::{get_points_vector}, self}};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -1293,13 +1293,12 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     }
 
     pub fn draw_shape(&mut self, driver : &Driver, shape: &dyn Shape){
-        self.draw_barrier_updates(driver, get_points_vector(shape, X as usize))
+        self.draw_barrier_updates(driver, get_points_vector(shape, X as usize));
     }
 
     fn draw_barrier_updates(&mut self,  driver : &Driver, points : Vec<u32>){
-
         driver.queue.write_buffer(&self.draw_points, 0, bytemuck::cast_slice(&points));
-        driver.queue.write_buffer(&self.draw_num, 0, bytemuck::bytes_of(&(points.len() as u32)));
+        driver.queue.write_buffer(&self.draw_num, 0, bytemuck::bytes_of(&(points.len() as u32 - 1)));
         driver.queue.submit(None);
 
         let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1308,7 +1307,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         cpass.set_pipeline(&self.barrier_draw);
         cpass.set_bind_group(0, &self.draw_bg, &[]);
         cpass.set_bind_group(1, &self.barrier_bg, &[]);
-        let work_groups = (points.len() as f32/256.0).ceil() as u32;
+        let work_groups = (points.len()/2) as u32;
         cpass.dispatch_workgroups(work_groups, 1, 1);
         }
         driver.queue.submit(Some(encoder.finish()));

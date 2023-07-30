@@ -9,9 +9,9 @@ struct Update{
 @group(1) @binding(0) var<storage, read_write> barrier: array<u32>;
 
 @compute
-@workgroup_size(256)
+@workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>){
-    if(id.x > num_updates){
+    if(id.x >= num_updates){
         return;
     }
     barrier[updates[id.x].location] = updates[id.x].value;

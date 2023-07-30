@@ -1,12 +1,12 @@
-use barrier_shapes::{Shape, blob::Blob, merge_shapes::merge, line};
+use barrier_shapes::{Shape, blob::{Blob, self}, line, curve::Curve, curve_collection::CurveCollection, merge_shapes::{get_points_vector, merge}};
 use driver::Driver;
 use lbm::ColorMap;
 use web_sys::console;
 use winit::{event_loop::{EventLoop, ControlFlow}, dpi::PhysicalSize, event::{Event, WindowEvent, ElementState}, window::Window};
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, convert::IntoWasmAbi};
 
 use lazy_static::lazy_static; // 1.4.0
-use std::{sync::Mutex, collections::HashSet};
+use std::{sync::{Mutex, atomic::AtomicBool}, collections::{HashSet, HashMap, btree_set::Difference}, time::Duration, mem};
 
 lazy_static! {
     static ref CURRENT_OUTPUT: Mutex<SummaryStat> = Mutex::new(SummaryStat::Curl);
@@ -19,6 +19,10 @@ lazy_static! {
     static ref CURRENT_COLOR_MAP: Mutex<ColorMap> = Mutex::new(ColorMap::Jet);
     static ref COLOR_CHANGED: Mutex<bool> = Mutex::new(false);
     static ref EQUILIBRIUM_RESET: Mutex<bool> = Mutex::new(false);
+    static ref CLICK_TYPE: Mutex<ClickType> = Mutex::new(ClickType::Inactive);
+    static ref CLICK_TYPE_CHANGED: Mutex<bool> = Mutex::new(true);
+    static ref UNDO_CHANGED: Mutex<bool> = Mutex::new(false);
+    static ref UNDO_COUNT: Mutex<usize> = Mutex::new(0);
 }
 
 use crate::{lbm::SummaryStat, barrier_shapes::line::Line};
@@ -29,14 +33,15 @@ pub mod lbm;
 
 const X_DIM:u32 = 2560;
 const Y_DIM:u32 = 1440;
+const STRETCH: f32 = 1.5;
 const OMEGA:f32 = 1.0/(0.5 + 0.3);
 
 
 pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
+
     let driver = Driver::new(&window).await;
 
     let mut lbm = lbm::LBM::<X_DIM,Y_DIM>::new(&driver, OMEGA);
-
     let mut pressed = false; 
     let mut click_handler = ClickHandler::new();
     let mut current_position: (isize, isize) = (0,0);
@@ -71,20 +76,25 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
             Event::WindowEvent { 
                 event: WindowEvent::CursorMoved{position, ..}, ..  
             } => {
-                console::log_1(&format!("Pressed from cursor move: {}", pressed).into());
+                let temp:(i32, i32) = position.into();
+                current_position = ClickHandler::validate_click(((temp.0 as f32/1.5) as isize, (temp.1 as f32/1.5) as isize));
                 if pressed{
-                    let temp:(i32, i32) = position.into();
-                    current_position = (temp.0 as isize, temp.1 as isize);
-                    click_handler.handle_movement((temp.0 as isize, temp.1 as isize));
+                    click_handler.handle_movement(current_position);
                 }
             }
 
             Event::WindowEvent{
                 event: WindowEvent::MouseInput {state, ..}, ..
             } => {
-                console::log_1(&format!("Pressed from mouse input: {:?}", state).into());
+                let mut click_type_changed = CLICK_TYPE_CHANGED.lock().unwrap();
+                if *click_type_changed{
+                    let t = CLICK_TYPE.lock().unwrap();
+                    click_handler.current_type = *t;
+                    *click_type_changed = false;
+                }
                 if state == ElementState::Released{
                     pressed = false;
+                    click_handler.handle_release();
                 } else{
                     pressed = true;
                     click_handler.handle_click(current_position);
@@ -93,10 +103,29 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
 
             Event::RedrawRequested(_) => {
                 let paused = *PAUSE.lock().unwrap();
-                let barrier_redraw = !click_handler.current_blob.is_empty();
+                let mut barrier_redraw = !click_handler.current_blob.is_empty() || !click_handler.current_curve.is_empty();
                 let mut output_changed = OUTPUT_CHANGED.lock().unwrap();
                 let mut color_changed = COLOR_CHANGED.lock().unwrap();
                 let mut equilibrium_reset = EQUILIBRIUM_RESET.lock().unwrap();
+                let mut undo_changed = UNDO_CHANGED.lock().unwrap();
+
+                if *undo_changed{
+                    let mut undo_count = UNDO_COUNT.lock().unwrap();
+                    let mut undo_blob = Blob::new_empty();
+                    for i in 0..*undo_count{
+                        // click_handler.test_undo();
+                        match click_handler.undo() {
+                            Some(u) => undo_blob.join(&*u),
+                            None => {},
+                        }
+                    }
+                    if !undo_blob.is_empty(){
+                        lbm.draw_shape(&driver, &undo_blob);
+                    }
+                    click_handler.empty_all();
+                    barrier_redraw = false;
+                    *undo_count = 0;
+                }
 
                 if *equilibrium_reset{
                     lbm.reset_to_equilibrium(&driver);
@@ -112,8 +141,9 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
                 }
 
                 if barrier_redraw{
+                    click_handler.current_blob.join(&click_handler.current_curve);
                     lbm.draw_shape(&driver, &click_handler.current_blob);
-                    click_handler.update();
+                    click_handler.update(pressed, current_position);
                 }
 
                 let mut viscosity_changed = VISCOSITY_CHANGED.lock().unwrap();
@@ -127,9 +157,10 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
                 if !paused{
                     let current:u32 =  *COMPUTE_PER_RENDER.lock().unwrap();
                     lbm.iterate(&driver, current as usize);
-                }else if *output_changed || barrier_redraw || *color_changed || *equilibrium_reset{
+                }else if *output_changed || barrier_redraw || *color_changed || *equilibrium_reset || *undo_changed{
                     lbm.rerender(&driver);
                 }
+                *undo_changed = false;
                 *output_changed = false;
                 *color_changed = false;
                 *equilibrium_reset = false;
@@ -147,7 +178,9 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
     });
 }
 
-enum ClickType{
+#[wasm_bindgen]
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum ClickType{
     Line,
     Erase, 
     Draw, 
@@ -158,8 +191,11 @@ struct ClickHandler{
     current_type: ClickType,
     line_points: Vec<(isize, isize)>,
     current_blob: Blob,
+    current_curve: Curve,
+    contiguous_curve: CurveCollection,
     undo_stack: Vec<Box<dyn Shape>>,
-    undo_number: usize
+    undo_number: usize,
+    history: HashMap<(isize, isize), Vec<bool>>
 }
 
 impl ClickHandler{
@@ -171,22 +207,53 @@ impl ClickHandler{
             line_points: Vec::<(isize, isize)>::new(),
             undo_stack: Vec::<Box<dyn Shape>>::new(),
             undo_number: 0,
+            current_curve: Curve::new(),
+            contiguous_curve: CurveCollection::new(),
+            history: HashMap::<(isize, isize), Vec<bool>>::new(),
         }
     }
 
     pub fn handle_movement(&mut self, location: (isize, isize)){
         match self.current_type {
-            ClickType::Erase => self.erase_update(location),
-            ClickType::Draw => self.draw_update(location),
+            ClickType::Erase => self.current_curve.erase_segment(location, X_DIM as isize, Y_DIM as isize),
+            ClickType::Draw => self.current_curve.add_segment(location, X_DIM as isize, Y_DIM as isize),
             _ => (),
         }  
+    }
+
+    pub fn handle_release(&mut self){
+        match self.current_type {
+            ClickType::Erase => self.release(),
+            ClickType::Draw => self.release(),
+            _ => (),
+        }
+    }
+
+    fn release(&mut self){
+        //Join current curve to blob so it will be rendered
+        self.current_blob.join(&self.current_curve);
+
+        //Add current to contiguous curve
+        let mut temp = Curve::new();
+        mem::swap(&mut self.current_curve, &mut temp);
+        self.contiguous_curve.add_curve(temp);
+
+        //Add contiguous curve to history
+        let mut temp = CurveCollection::new();
+        mem::swap(&mut self.contiguous_curve, &mut temp);
+        self.add_to_history(Box::new(temp));
+    }
+
+    pub fn empty_all(&mut self){
+        self.current_blob.empty();
+        self.current_curve.empty();
     }
 
     pub fn handle_click(&mut self, click_location: (isize, isize)){
         match self.current_type {
             ClickType::Line => self.line_click(click_location),
-            ClickType::Erase => self.erase_update(click_location),
-            ClickType::Draw => self.draw_update(click_location),
+            ClickType::Erase => self.current_curve.erase_segment(click_location, X_DIM as isize, Y_DIM as isize),
+            ClickType::Draw => self.current_curve.add_segment(click_location, X_DIM as isize, Y_DIM as isize),
             _ => (),
         }
     }
@@ -196,16 +263,27 @@ impl ClickHandler{
         self.line_points.clear();
     }
 
-    pub fn update(&mut self){
-        self.undo_stack.push(Box::new(self.current_blob.negate()));
+    pub fn update(&mut self, pressed: bool, location: (isize, isize)){
         self.current_blob.empty();
+        if pressed && *CLICK_TYPE.lock().unwrap() == ClickType::Draw{
+            self.draw_update(location);
+        }
+        if pressed && *CLICK_TYPE.lock().unwrap() == ClickType::Erase{
+            self.erase_update(location);
+        }
     }
 
     pub fn undo(&mut self) -> Option<Box<dyn Shape>>{
-        if self.current_blob.is_empty(){
-            return self.undo_stack.pop();
+        if self.current_blob.is_empty() && self.current_curve.is_empty(){
+            match self.undo_stack.pop() {
+                Some(s) => 
+                return Some(self.remove_shape(&*s)),
+                None => return None,
+            };
         } else {
+            console::log_1(&"This is where undo is empty".into());
             self.current_blob.empty();
+            self.current_curve.empty();
         }
         None
     }
@@ -214,40 +292,97 @@ impl ClickHandler{
         self.line_points.push(click_location);
         if self.line_points.len() >= 2{
             let shape = line::Line::new(self.line_points[0], 
-                                                 self.line_points[1], 
+                                              self.line_points[1], 
                                                             X_DIM as isize, 
                                                             Y_DIM as isize)
                                                             .unwrap();
-            self.current_blob = merge(&vec![&self.current_blob, &shape], X_DIM as usize);
+            self.current_blob.join(&shape);
+            self.add_to_history(Box::new(shape));
             self.line_points.clear();
         }
     }
 
     fn draw_update(&mut self, click_location: (isize, isize)){
-        let valid_points = Self::valid_points(&click_location).iter().map(|x| (x.0, x.1, true)).collect();
-        self.current_blob.add(&valid_points, X_DIM, Y_DIM);
+        let mut temp = Curve::new();
+        mem::swap(&mut self.current_curve, &mut temp);
+        self.contiguous_curve.add_curve(temp);
+        self.current_curve.add_segment(click_location, X_DIM as isize, Y_DIM as isize);
     }
 
     fn erase_update(&mut self, click_location: (isize, isize)){
-        let valid_points = Self::valid_points(&click_location).iter().map(|x| (x.0, x.1, false)).collect();
-        self.current_blob.add(&valid_points, X_DIM, Y_DIM);
+        let mut temp = Curve::new();
+        mem::swap(&mut self.current_curve, &mut temp);
+        self.contiguous_curve.add_curve(temp);
+        self.current_curve.erase_segment(click_location, X_DIM as isize, Y_DIM as isize);
     }
 
-    fn filter_points(click_location: &(isize, isize)) -> bool{
-        click_location.0 < X_DIM as isize && click_location.1 < Y_DIM as isize
-    } 
-
-    fn cube(click_location: &(isize, isize)) -> Vec<(isize, isize)>{
-        vec![(click_location.0 - 1, click_location.1 - 1), (click_location.0, click_location.1 - 1), (click_location.0 + 1, click_location.1 - 1),
-             (click_location.0 - 1, click_location.1), (click_location.0, click_location.1), (click_location.0 + 1, click_location.1),
-             (click_location.0 - 1, click_location.1 + 1), (click_location.0, click_location.1 + 1), (click_location.0 + 1, click_location.1 + 1)]
+    pub fn validate_click(click_location: (isize, isize)) -> (isize, isize){
+        let mut new_click = (0,0);
+        if click_location.0 < 0{
+            new_click.0 = 0;
+        } else if click_location.0 >= X_DIM as isize {
+            new_click.0 = X_DIM as isize - 1;
+        } else {
+            new_click.0 = click_location.0;
+        }
+        if click_location.1 < 0{
+            new_click.1 = 0;
+        } else if click_location.1 >= Y_DIM as isize {
+            new_click.1 = Y_DIM as isize - 1;
+        } else{
+            new_click.1 = click_location.1;
+        }
+        new_click
     }
 
-    fn valid_points(point: &(isize, isize)) -> Vec<(isize, isize)>{
-        Self::cube(point).into_iter().filter(|x| Self::filter_points(x)).collect()
+    fn add_to_history(&mut self, shape: Box<dyn Shape>){
+        for i in shape.get_points(){
+            match self.history.get_mut(&(i.0, i.1)){
+                Some(vec) => {vec.push(i.2)},
+                None => {
+                    self.history.insert((i.0, i.1), vec![i.2]);
+                },
+            };
+        }
+        self.undo_stack.push(shape);
+    }
+
+    fn remove_shape(&mut self, shape: &dyn Shape) -> Box<dyn Shape>{
+        let mut points = Vec::<(isize, isize, bool)>::new();
+        for i in shape.get_points(){
+            match self.history.get_mut(&(i.0, i.1)){
+                Some(vec) => {
+                    vec.pop(); 
+                    points.push((i.0, i.1, Self::add_point(vec)));
+                    if vec.is_empty(){
+                        // console::log_1(&"Removing from history".into());
+                        self.history.remove(&(i.0, i.1));
+                    }
+                },
+                None => {
+                    points.push((i.0, i.1, false));
+                    console::log_1(&"remove weirdness".into());
+                },
+            };
+        }
+        if self.history.is_empty(){
+            // console::log_1(&"history empty".into());
+        }
+        points.sort();
+        let mut blob = Blob::new(HashSet::new());
+        blob.add(&points, X_DIM, Y_DIM);
+        Box::new(blob)
+    }
+
+    fn add_point(vec: &Vec<bool>) -> bool{
+       if vec.is_empty(){
+        return false;
+       }
+       vec.last().unwrap().to_owned()
     }
 
 }
+
 
 #[wasm_bindgen]
 struct WASMInteraction{
@@ -264,16 +399,20 @@ impl WASMInteraction {
         console::log_1(&"SET OUTPUT".into());
     }
 
+    pub fn set_draw_type(draw_type: ClickType){
+        let mut mutex_changer = CLICK_TYPE.lock().unwrap();
+        *mutex_changer = draw_type;
+        let mut mutex_changer = CLICK_TYPE_CHANGED.lock().unwrap();
+        *mutex_changer = true;
+        console::log_1(&format!("SET CLICKTYPE {:?}", draw_type).into());
+    }
+
     pub fn set_color_map(color_map:ColorMap){
         let mut mutex_changer = CURRENT_COLOR_MAP.lock().unwrap();
         *mutex_changer = color_map;
         let mut mutex_changer = COLOR_CHANGED.lock().unwrap();
         *mutex_changer = true;
         console::log_1(&"SET COLOR".into());
-    }
-
-    pub fn test(){
-        console::log_1(&"Hello using web-sys".into());
     }
 
     pub fn toggle_pause(){
@@ -299,14 +438,23 @@ impl WASMInteraction {
         let mut mutex_changer = EQUILIBRIUM_RESET.lock().unwrap();
         *mutex_changer = true;
     }
+
+    pub fn undo(){
+        let mut mutex_changer = UNDO_COUNT.lock().unwrap();
+        *mutex_changer += 1;
+        let mut mutex_changer = UNDO_CHANGED.lock().unwrap();
+        *mutex_changer = true;
+    }
 }
+
+
 
 
 #[wasm_bindgen]
 pub fn run() {
     let event_loop = EventLoop::new();
     let window = winit::window::WindowBuilder::new()
-                        .with_inner_size(PhysicalSize{width: X_DIM as f32, height: Y_DIM as f32})
+                        .with_inner_size(PhysicalSize{width: X_DIM as f32 * 1.5, height: Y_DIM as f32 * 1.5})
                         .build(&event_loop).unwrap();
     use winit::platform::web::WindowExtWebSys;
     use wasm_bindgen_futures;

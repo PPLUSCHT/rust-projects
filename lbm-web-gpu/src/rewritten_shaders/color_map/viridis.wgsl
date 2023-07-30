@@ -13,7 +13,7 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>){
         return;
     }
     
-    let color = clamp(10.0 * value[global_invocation_id.x],-2.0, 2.0);
+    let color = clamp(15.0 * value[global_invocation_id.x],-2.0, 2.0);
     let color_block = i32(floor(color));
 
     switch color_block{
