@@ -5,109 +5,118 @@
   </head>
   <body>
     <script type="module">
-      import init, {run, WASMInteraction, SummaryStat, ColorMap, ClickType} from "/pkg/lbm_web_gpu.js";
-      init().then(() => {
-        run();
-      });
+      import init, {run, WASMInteraction, SummaryStat, ColorMap, ClickType, Resolution} from "/pkg/lbm_web_gpu.js";
+      await init();
+      console.log(window.devicePixelRatio);
+      run(window.devicePixelRatio, Resolution.UHD, 1000, 500);
 
-      function setCurl(){
-        WASMInteraction.set_output(SummaryStat.Curl);
-      }
+    //   function setCurl(){
+    //     WASMInteraction.set_output(SummaryStat.Curl);
+    //   }
 
-      function setEquilibrium(){
-        WASMInteraction.reset_to_equilibrium();
-      }
+    //   function setEquilibrium(){
+    //     WASMInteraction.reset_to_equilibrium();
+    //   }
 
-      function setUX(){
-        WASMInteraction.set_output(SummaryStat.Ux);
-      }
-      function setUY(){
-        WASMInteraction.set_output(SummaryStat.Uy);
-      }
+    //   function setUX(){
+    //     WASMInteraction.set_output(SummaryStat.Ux);
+    //   }
+    //   function setUY(){
+    //     WASMInteraction.set_output(SummaryStat.Uy);
+    //   }
 
-      function setRho(){
-        WASMInteraction.set_output(SummaryStat.Rho);
-      }
+    //   function setRho(){
+    //     WASMInteraction.set_output(SummaryStat.Rho);
+    //   }
 
-      function setViridis(){
-        WASMInteraction.set_color_map(ColorMap.Viridis);
-      }
+    //   function setViridis(){
+    //     WASMInteraction.set_color_map(ColorMap.Viridis);
+    //   }
       
-      function setInferno(){
-        WASMInteraction.set_color_map(ColorMap.Inferno);
-      }
+    //   function setInferno(){
+    //     WASMInteraction.set_color_map(ColorMap.Inferno);
+    //   }
 
-      function setJet(){
-        WASMInteraction.set_color_map(ColorMap.Jet);
-      }
+    //   function setJet(){
+    //     WASMInteraction.set_color_map(ColorMap.Jet);
+    //   }
 
-      function setInactive(){
-        WASMInteraction.set_draw_type(ClickType.Inactive);
-      }
+    //   function setInactive(){
+    //     WASMInteraction.set_draw_type(ClickType.Inactive);
+    //   }
 
-      function setDraw(){
-        WASMInteraction.set_draw_type(ClickType.Draw);
-      }
+    //   function setDraw(){
+    //     WASMInteraction.set_draw_type(ClickType.Draw);
+    //   }
 
-      function setErase(){
-        WASMInteraction.set_draw_type(ClickType.Erase);
-      }
+    //   function setErase(){
+    //     WASMInteraction.set_draw_type(ClickType.Erase);
+    //   }
 
-      function setLine(){
-        WASMInteraction.set_draw_type(ClickType.Line);
-      }
+    //   function setLine(){
+    //     WASMInteraction.set_draw_type(ClickType.Line);
+    //   }
 
-      function undo(){
-        WASMInteraction.undo();
-      }
+    //   function undo(){
+    //     WASMInteraction.undo();
+    //   }
 
-      const curl = document.getElementById("curl-button");
-      const Ux = document.getElementById("Ux-button");
-      const Uy = document.getElementById("Uy-button");
-      const Rho = document.getElementById("Rho-button");
-      const Equilibrium = document.getElementById("Equilibrium");
+    //   function change(){
+    //     WASMInteraction.resize(Math.floor(x_dim.value), Math.floor(y_dim.value));
+    //   }
 
-      const inactive = document.getElementById("Inactive");
-      const erase = document.getElementById("Erase");
-      const draw = document.getElementById("Draw");
-      const line = document.getElementById("Line");
+    //   const curl = document.getElementById("curl-button");
+    //   const Ux = document.getElementById("Ux-button");
+    //   const Uy = document.getElementById("Uy-button");
+    //   const Rho = document.getElementById("Rho-button");
+    //   const Equilibrium = document.getElementById("Equilibrium");
 
-      const viridis = document.getElementById("Viridis");
-      const inferno = document.getElementById("Inferno");
-      const jet = document.getElementById("Jet");
+    //   const inactive = document.getElementById("Inactive");
+    //   const erase = document.getElementById("Erase");
+    //   const draw = document.getElementById("Draw");
+    //   const line = document.getElementById("Line");
 
-      const pause = document.getElementById("Pause");
-      const slider = document.getElementById("ComputeRatio");
-      const viscosity_slider = document.getElementById("Viscosity");
-      const undo_b = document.getElementById("undo");
+    //   const viridis = document.getElementById("Viridis");
+    //   const inferno = document.getElementById("Inferno");
+    //   const jet = document.getElementById("Jet");
 
-      curl.addEventListener("click", setCurl);
-      Ux.addEventListener("click", setUX);
-      Uy.addEventListener("click", setUY);
-      Rho.addEventListener("click", setRho);
+    //   const pause = document.getElementById("Pause");
+    //   const slider = document.getElementById("ComputeRatio");
+    //   const viscosity_slider = document.getElementById("Viscosity");
+    //   const undo_b = document.getElementById("undo");
 
-      inactive.addEventListener("click", setInactive);
-      erase.addEventListener("click", setErase);
-      draw.addEventListener("click", setDraw);
-      line.addEventListener("click", setLine);
-      undo_b.addEventListener("click", undo);
+    //   const x_dim = document.getElementById("x_dim");
+    //   const y_dim = document.getElementById("y_dim");
+    //   const run_b = document.getElementById("run");
 
-      Equilibrium.addEventListener("click", setEquilibrium);
+    //   curl.addEventListener("click", setCurl);
+    //   Ux.addEventListener("click", setUX);
+    //   Uy.addEventListener("click", setUY);
+    //   Rho.addEventListener("click", setRho);
 
-      viridis.addEventListener("click", setViridis);
-      inferno.addEventListener("click", setInferno);
-      jet.addEventListener("click", setJet);
+    //   inactive.addEventListener("click", setInactive);
+    //   erase.addEventListener("click", setErase);
+    //   draw.addEventListener("click", setDraw);
+    //   line.addEventListener("click", setLine);
+    //   undo_b.addEventListener("click", undo);
 
-      pause.addEventListener("click", WASMInteraction.toggle_pause);
-      slider.onchange = function() {
-        console.log(this.value);
-        WASMInteraction.update_compute_rate(Math.floor(this.value));
-      }
-      viscosity_slider.onchange = function(){
-        WASMInteraction.update_viscosity(this.value);
-      }
-    </script>
-    <div>
+    //   Equilibrium.addEventListener("click", setEquilibrium);
+
+    //   viridis.addEventListener("click", setViridis);
+    //   inferno.addEventListener("click", setInferno);
+    //   jet.addEventListener("click", setJet);
+
+    //   pause.addEventListener("click", WASMInteraction.toggle_pause);
+    //   slider.onchange = function() {
+    //     console.log(this.value);
+    //     WASMInteraction.update_compute_rate(Math.floor(this.value));
+    //   }
+    //   viscosity_slider.onchange = function(){
+    //     WASMInteraction.update_viscosity(this.value);
+    //   }
+    //   run_b.addEventListener("click", change);
+    // </script>
+    <!-- <div>
       <button id="curl-button">Curl</button>
       <button id="Ux-button">Ux</button>
       <button id="Uy-button">Uy</button>
@@ -127,7 +136,10 @@
       <button id="Pause">Pause</button>
       <input type="range" min="1" max="30" value="15" class="slider" id="ComputeRatio">
       <input type="range" min="0.005" max="0.5" value="0.1" class="slider" id="Viscosity" step="0.01">
-    </div>
+      <input type="number" id="x_dim">
+      <input type="number" id="y_dim">
+      <button id="run">Run</button>
+    </div> -->
 
   </body>
 </html>

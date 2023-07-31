@@ -1,49 +1,46 @@
-use barrier_shapes::{Shape, blob::{Blob, self}, line, curve::Curve, curve_collection::CurveCollection, merge_shapes::{get_points_vector, merge}};
+use barrier_shapes::{Shape, blob::Blob, line, curve::Curve, curve_collection::CurveCollection};
 use driver::Driver;
 use lbm::ColorMap;
 use web_sys::console;
-use winit::{event_loop::{EventLoop, ControlFlow}, dpi::PhysicalSize, event::{Event, WindowEvent, ElementState}, window::Window};
-use wasm_bindgen::{prelude::*, convert::IntoWasmAbi};
+use winit::{event_loop::{EventLoop, ControlFlow}, dpi::LogicalSize, event::{Event, WindowEvent, ElementState}, window::Window};
+use wasm_bindgen::prelude::*;
 
 use lazy_static::lazy_static; // 1.4.0
-use std::{sync::{Mutex, atomic::AtomicBool}, collections::{HashSet, HashMap, btree_set::Difference}, time::Duration, mem};
+use std::{sync::Mutex, collections::{HashSet, HashMap}, mem};
+use crate::lbm::SummaryStat;
 
 lazy_static! {
     static ref CURRENT_OUTPUT: Mutex<SummaryStat> = Mutex::new(SummaryStat::Curl);
     static ref BARRIER_CHANGE: Mutex<bool> = Mutex::new(false);
-    static ref PAUSE: Mutex<bool> = Mutex::new(true);
+    static ref PAUSE: Mutex<bool> = Mutex::new(false);
     static ref OUTPUT_CHANGED: Mutex<bool> = Mutex::new(true);
-    static ref COMPUTE_PER_RENDER: Mutex<u32> = Mutex::new(50);
+    static ref COMPUTE_PER_RENDER: Mutex<u32> = Mutex::new(15);
     static ref VISCOSITY: Mutex<f32> = Mutex::new(0.1);
     static ref VISCOSITY_CHANGED: Mutex<bool> = Mutex::new(false);
     static ref CURRENT_COLOR_MAP: Mutex<ColorMap> = Mutex::new(ColorMap::Jet);
     static ref COLOR_CHANGED: Mutex<bool> = Mutex::new(false);
-    static ref EQUILIBRIUM_RESET: Mutex<bool> = Mutex::new(false);
+    static ref EQUILIBRIUM_RESET: Mutex<bool> = Mutex::new(true);
     static ref CLICK_TYPE: Mutex<ClickType> = Mutex::new(ClickType::Inactive);
     static ref CLICK_TYPE_CHANGED: Mutex<bool> = Mutex::new(true);
     static ref UNDO_CHANGED: Mutex<bool> = Mutex::new(false);
     static ref UNDO_COUNT: Mutex<usize> = Mutex::new(0);
+    static ref BARRIER_RESET: Mutex<bool> = Mutex::new(false);
 }
-
-use crate::{lbm::SummaryStat, barrier_shapes::line::Line};
 
 pub mod driver;
 pub mod barrier_shapes;
 pub mod lbm;
 
-const X_DIM:u32 = 2560;
-const Y_DIM:u32 = 1440;
-const STRETCH: f32 = 1.5;
 const OMEGA:f32 = 1.0/(0.5 + 0.3);
 
 
-pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
+pub async fn run_wasm(event_loop: EventLoop<()>, window:Window, x:u32, y:u32, pixel_ratio: f32) {
 
     let driver = Driver::new(&window).await;
 
-    let mut lbm = lbm::LBM::<X_DIM,Y_DIM>::new(&driver, OMEGA);
+    let mut lbm = lbm::LBM::new(&driver, OMEGA, x, y);
     let mut pressed = false; 
-    let mut click_handler = ClickHandler::new();
+    let mut click_handler = ClickHandler::new(x, y);
     let mut current_position: (isize, isize) = (0,0);
  
     let swapchain_capabilities = driver.surface.get_capabilities(&driver.adapter);
@@ -76,8 +73,9 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
             Event::WindowEvent { 
                 event: WindowEvent::CursorMoved{position, ..}, ..  
             } => {
-                let temp:(i32, i32) = position.into();
-                current_position = ClickHandler::validate_click(((temp.0 as f32/1.5) as isize, (temp.1 as f32/1.5) as isize));
+                let temp:(i32, i32) = position.to_logical::<i32>(pixel_ratio.into()).into();
+                console::log_1(&format!("{}:{}", temp.0, temp.1).into());
+                current_position = click_handler.validate_click((temp.0 as isize, temp.1 as isize));
                 if pressed{
                     click_handler.handle_movement(current_position);
                 }
@@ -89,7 +87,7 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
                 let mut click_type_changed = CLICK_TYPE_CHANGED.lock().unwrap();
                 if *click_type_changed{
                     let t = CLICK_TYPE.lock().unwrap();
-                    click_handler.current_type = *t;
+                    click_handler.switch_click_type(*t);
                     *click_type_changed = false;
                 }
                 if state == ElementState::Released{
@@ -102,17 +100,28 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
             }
 
             Event::RedrawRequested(_) => {
+
                 let paused = *PAUSE.lock().unwrap();
                 let mut barrier_redraw = !click_handler.current_blob.is_empty() || !click_handler.current_curve.is_empty();
                 let mut output_changed = OUTPUT_CHANGED.lock().unwrap();
                 let mut color_changed = COLOR_CHANGED.lock().unwrap();
                 let mut equilibrium_reset = EQUILIBRIUM_RESET.lock().unwrap();
                 let mut undo_changed = UNDO_CHANGED.lock().unwrap();
+                let mut barrier_reset = BARRIER_RESET.lock().unwrap();
+
+                if *barrier_reset{
+                    lbm.reset_barrier(&driver);
+                    click_handler.clear_barrier();
+                    barrier_redraw = false;
+                    let mut undo_count = UNDO_COUNT.lock().unwrap();
+                    *undo_count = 0;
+                    *undo_changed = false;
+                }
 
                 if *undo_changed{
                     let mut undo_count = UNDO_COUNT.lock().unwrap();
                     let mut undo_blob = Blob::new_empty();
-                    for i in 0..*undo_count{
+                    for _ in 0..*undo_count{
                         // click_handler.test_undo();
                         match click_handler.undo() {
                             Some(u) => undo_blob.join(&*u),
@@ -157,13 +166,14 @@ pub async fn run_wasm(event_loop: EventLoop<()>, window:Window) {
                 if !paused{
                     let current:u32 =  *COMPUTE_PER_RENDER.lock().unwrap();
                     lbm.iterate(&driver, current as usize);
-                }else if *output_changed || barrier_redraw || *color_changed || *equilibrium_reset || *undo_changed{
+                }else if *output_changed || barrier_redraw || *color_changed || *equilibrium_reset || *undo_changed || *barrier_reset{
                     lbm.rerender(&driver);
                 }
                 *undo_changed = false;
                 *output_changed = false;
                 *color_changed = false;
                 *equilibrium_reset = false;
+                *barrier_reset = false;
             }
 
             Event::MainEventsCleared => {
@@ -194,29 +204,40 @@ struct ClickHandler{
     current_curve: Curve,
     contiguous_curve: CurveCollection,
     undo_stack: Vec<Box<dyn Shape>>,
-    undo_number: usize,
-    history: HashMap<(isize, isize), Vec<bool>>
+    history: HashMap<(isize, isize), Vec<bool>>,
+    x: u32, 
+    y: u32,
 }
 
 impl ClickHandler{
     
-    pub fn new() -> ClickHandler{
+    pub fn new(x: u32, y:u32) -> ClickHandler{
         ClickHandler{
             current_type: ClickType::Draw,
             current_blob: Blob { points: HashSet::<(isize, isize, bool)>::new() },
             line_points: Vec::<(isize, isize)>::new(),
             undo_stack: Vec::<Box<dyn Shape>>::new(),
-            undo_number: 0,
             current_curve: Curve::new(),
             contiguous_curve: CurveCollection::new(),
             history: HashMap::<(isize, isize), Vec<bool>>::new(),
+            x,
+            y,
         }
+    }
+
+    pub fn clear_barrier(&mut self){
+        self.current_curve = Curve::new();
+        self.contiguous_curve = CurveCollection::new();
+        self.undo_stack.clear();
+        self.history.clear();
+        self.current_blob.empty();
+        self.line_points.clear();
     }
 
     pub fn handle_movement(&mut self, location: (isize, isize)){
         match self.current_type {
-            ClickType::Erase => self.current_curve.erase_segment(location, X_DIM as isize, Y_DIM as isize),
-            ClickType::Draw => self.current_curve.add_segment(location, X_DIM as isize, Y_DIM as isize),
+            ClickType::Erase => self.current_curve.erase_segment(location, self.x as isize, self.y as isize),
+            ClickType::Draw => self.current_curve.add_segment(location, self.x as isize, self.y as isize),
             _ => (),
         }  
     }
@@ -252,8 +273,8 @@ impl ClickHandler{
     pub fn handle_click(&mut self, click_location: (isize, isize)){
         match self.current_type {
             ClickType::Line => self.line_click(click_location),
-            ClickType::Erase => self.current_curve.erase_segment(click_location, X_DIM as isize, Y_DIM as isize),
-            ClickType::Draw => self.current_curve.add_segment(click_location, X_DIM as isize, Y_DIM as isize),
+            ClickType::Erase => self.current_curve.erase_segment(click_location, self.x as isize, self.y as isize),
+            ClickType::Draw => self.current_curve.add_segment(click_location, self.x as isize, self.y as isize),
             _ => (),
         }
     }
@@ -293,8 +314,8 @@ impl ClickHandler{
         if self.line_points.len() >= 2{
             let shape = line::Line::new(self.line_points[0], 
                                               self.line_points[1], 
-                                                            X_DIM as isize, 
-                                                            Y_DIM as isize)
+                                                            self.x as isize, 
+                                                            self.y as isize)
                                                             .unwrap();
             self.current_blob.join(&shape);
             self.add_to_history(Box::new(shape));
@@ -306,29 +327,29 @@ impl ClickHandler{
         let mut temp = Curve::new();
         mem::swap(&mut self.current_curve, &mut temp);
         self.contiguous_curve.add_curve(temp);
-        self.current_curve.add_segment(click_location, X_DIM as isize, Y_DIM as isize);
+        self.current_curve.add_segment(click_location, self.x as isize, self.y as isize);
     }
 
     fn erase_update(&mut self, click_location: (isize, isize)){
         let mut temp = Curve::new();
         mem::swap(&mut self.current_curve, &mut temp);
         self.contiguous_curve.add_curve(temp);
-        self.current_curve.erase_segment(click_location, X_DIM as isize, Y_DIM as isize);
+        self.current_curve.erase_segment(click_location, self.x as isize, self.x as isize);
     }
 
-    pub fn validate_click(click_location: (isize, isize)) -> (isize, isize){
+    pub fn validate_click(&self, click_location: (isize, isize)) -> (isize, isize){
         let mut new_click = (0,0);
         if click_location.0 < 0{
             new_click.0 = 0;
-        } else if click_location.0 >= X_DIM as isize {
-            new_click.0 = X_DIM as isize - 1;
+        } else if click_location.0 >= self.x as isize {
+            new_click.0 = self.x as isize - 1;
         } else {
             new_click.0 = click_location.0;
         }
         if click_location.1 < 0{
             new_click.1 = 0;
-        } else if click_location.1 >= Y_DIM as isize {
-            new_click.1 = Y_DIM as isize - 1;
+        } else if click_location.1 >= self.y as isize {
+            new_click.1 = self.y as isize - 1;
         } else{
             new_click.1 = click_location.1;
         }
@@ -370,7 +391,7 @@ impl ClickHandler{
         }
         points.sort();
         let mut blob = Blob::new(HashSet::new());
-        blob.add(&points, X_DIM, Y_DIM);
+        blob.add(&points, self.x, self.y);
         Box::new(blob)
     }
 
@@ -445,16 +466,42 @@ impl WASMInteraction {
         let mut mutex_changer = UNDO_CHANGED.lock().unwrap();
         *mutex_changer = true;
     }
+
+    pub fn clear_barrier(){
+        let mut mutex_changer = BARRIER_RESET.lock().unwrap();
+        *mutex_changer = true;
+    }
+}
+
+#[wasm_bindgen]
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Resolution{
+    TEST = 100,
+    NHD = 230400, 
+    HD =  921600,
+    FHD = 2073600,
+    UHD = 3686400,
+}
+
+fn calculate_dimensions(res: Resolution, width: u32, height: u32) -> (u32, u32, f32){
+    let aspect_ratio = height as f64/ width as f64;
+    console::log_1(&format!("ASP: {}", aspect_ratio).into());
+    let x_pixels = (res as isize as f64/aspect_ratio).sqrt().floor() as u32;
+    console::log_1(&format!("X_PIXELS: {}", x_pixels).into());
+    let pixel_size = width as f64/ x_pixels as f64;
+    console::log_1(&format!("PIXEL_SIZE: {}", pixel_size).into());
+    let y_pixels = (height as f64/pixel_size).floor() as u32;
+    console::log_1(&format!("Y_PIXELS: {}", y_pixels).into());
+    (x_pixels, y_pixels, pixel_size as f32)
 }
 
 
-
-
 #[wasm_bindgen]
-pub fn run() {
+pub fn run(pixel_ratio: f32, res: Resolution, width: u32, height: u32) {
     let event_loop = EventLoop::new();
+    let dimensions = calculate_dimensions(res, width, height);
     let window = winit::window::WindowBuilder::new()
-                        .with_inner_size(PhysicalSize{width: X_DIM as f32 * 1.5, height: Y_DIM as f32 * 1.5})
+                        .with_inner_size(LogicalSize{width: dimensions.0 as f32 * dimensions.2, height: dimensions.1 as f32 * dimensions.2})
                         .build(&event_loop).unwrap();
     use winit::platform::web::WindowExtWebSys;
     use wasm_bindgen_futures;
@@ -469,5 +516,5 @@ pub fn run() {
         })
         .expect("couldn't append canvas to document body");
     console::log_1(&"Hello from before run".into());
-    wasm_bindgen_futures::spawn_local(run_wasm(event_loop, window));
+    wasm_bindgen_futures::spawn_local(run_wasm(event_loop, window, dimensions.0, dimensions.1, pixel_ratio * dimensions.2));
 }

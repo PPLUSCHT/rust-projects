@@ -1,5 +1,3 @@
-use wgpu::{Device, Features};
-
 pub struct Driver{
     pub size: winit::dpi::PhysicalSize<u32>,
     pub surface: wgpu::Surface,
@@ -25,13 +23,6 @@ impl Driver{
         })
         .await
         .expect("Failed to find an appropriate adapter");
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        use web_sys::console;
-        console::log_1(&format!("{:?}", adapter.limits()).into());
-        console::log_1(&format!("{:?}", adapter.features()).into());   
-    }
 
     // Create the logical device and command queue
     let (device, queue) = adapter

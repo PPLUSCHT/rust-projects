@@ -1,6 +1,4 @@
-use std::{collections::HashSet, cmp::Ordering};
-
-use web_sys::console;
+use std::collections::HashSet;
 
 use super::{Shape, blob::Blob};
 
@@ -13,20 +11,6 @@ pub fn merge(s1: &dyn Shape, s2: &dyn Shape) -> Blob{
 
 pub fn get_points_vector(shape: &dyn Shape, xdim: usize) -> Vec<u32>{
     shape.get_points().iter().flat_map(|x| vec![get_index(&x, xdim), get_value(&x)]).collect()
-}
-
-fn sorter(p1: &(isize, isize, bool), p2: &(isize, isize, bool)) -> Ordering{
-    if p1.0 > p2.0{
-        return Ordering::Greater;
-    } else if p1.0 < p2.0{
-        return Ordering::Less;
-    }
-    if p1.1 > p2.1{
-        return Ordering::Greater;
-    } else if p1.1 < p2.1{
-        return Ordering::Less;
-    }
-    Ordering::Equal
 }
 
 fn get_index(point: &(isize, isize, bool), xdim: usize) -> u32{

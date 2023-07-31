@@ -26,7 +26,7 @@ impl Line{
         ydim: isize) -> Result<Line, String>{
             
             if !Self::validate(end_point_1, end_point_2, xdim, ydim){
-                console::log_1(&format!("Endpoints ({},{}) ({},{}) are invalid with dimensions {} and {}", end_point_1.0, end_point_1.1,  end_point_2.0, end_point_2.1,  xdim, ydim).into());
+                console::error_1(&format!("Endpoints ({},{}) ({},{}) are invalid with dimensions {} and {}", end_point_1.0, end_point_1.1,  end_point_2.0, end_point_2.1,  xdim, ydim).into());
                 return Err(format!("Endpoints ({},{}) ({},{}) are invalid with dimensions {} and {}", end_point_1.0, end_point_1.1,  end_point_2.0, end_point_2.1,  xdim, ydim));
             }
             
@@ -95,16 +95,18 @@ impl Line{
         let mut output = Vec::<((isize, isize), (isize, isize))>::new();
         output.push(Self::order(end_point_1, end_point_2));
 
-        let mut left_endpoints = output[0].clone();
-        let mut right_endpoints = output[0].clone();
+        let left_endpoints = if output[0].0.1 > output[0].1.1 {
+                ((output[0].0.0, output[0].0.1 - 1),(output[0].0.0 + 1, output[0].0.1))
+            }else{
+                ((output[0].0.0, output[0].0.1 + 1),(output[0].0.0 + 1, output[0].0.1))
+            };
 
-        if output[0].0.1 > output[0].1.1 { 
-            left_endpoints = ((output[0].0.0, output[0].0.1 - 1),(output[0].0.0 + 1, output[0].0.1));
-            right_endpoints = ((output[0].1.0 - 1, output[0].1.1),(output[0].1.0, output[0].1.1 - 1)); 
-        } else {
-            left_endpoints = ((output[0].0.0, output[0].0.1 + 1),(output[0].0.0 + 1, output[0].0.1));
-            right_endpoints = ((output[0].1.0 - 1, output[0].1.1),(output[0].1.0, output[0].1.1 - 1));
-        }
+        let right_endpoints = if output[0].0.1 > output[0].1.1 {
+                ((output[0].1.0 - 1, output[0].1.1),(output[0].1.0, output[0].1.1 - 1))
+            } else {
+                ((output[0].1.0 - 1, output[0].1.1),(output[0].1.0, output[0].1.1 - 1))
+            };
+            
         output.push((left_endpoints.0, right_endpoints.0));
         output.push((left_endpoints.1, right_endpoints.1));
 
@@ -112,7 +114,6 @@ impl Line{
     }
 
     fn generate_endpoints_variable( end_point_1: (isize, isize), end_point_2: (isize, isize), thickness: usize) -> Vec<((isize, isize), (isize, isize))>{
-        //fix for eraser
         let mut output = Vec::<((isize, isize), (isize, isize))>::new();
         output.push(Self::order(end_point_1, end_point_2));
 

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use web_sys::console;
+
 
 use super::Shape;
 pub struct Blob{

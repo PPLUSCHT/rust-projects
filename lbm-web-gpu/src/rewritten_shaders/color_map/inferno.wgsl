@@ -38,6 +38,6 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>){
         }
     }
     if(barrier[global_invocation_id.x] == 1u){
-        colors[global_invocation_id.x] = vec3(0.0,0.5,0.0);
+        colors[global_invocation_id.x] = vec3(0.0,0.0,0.0);
     }
 }

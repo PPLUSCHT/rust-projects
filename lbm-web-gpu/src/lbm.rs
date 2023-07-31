@@ -1,11 +1,8 @@
-use web_sys::console;
 use wgpu::{CommandEncoder, util::BufferInitDescriptor, BufferUsages, ShaderStages,BindGroupDescriptor};
-use std::{mem, borrow::Cow, collections::HashSet, isize};
-use barrier_shapes::line::Line as line;
-
+use std::{mem, borrow::Cow};
 use wgpu::{Device, BindGroupEntry, util::DeviceExt, BindGroupLayout, ShaderModuleDescriptor, vertex_attr_array, VertexBufferLayout};
 
-use crate::{driver::Driver, barrier_shapes::{Shape, merge_shapes::{get_points_vector}, self}};
+use crate::{driver::Driver, barrier_shapes::{Shape, merge_shapes::get_points_vector}};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -25,7 +22,7 @@ pub enum ColorMap {
     Jet,
 }
 
-pub struct LBM<const X: u32, const Y: u32>{
+pub struct LBM{
     //Bind Groups
     pub collide_bg: wgpu::BindGroup,
     pub output_bg: wgpu::BindGroup,
@@ -86,27 +83,29 @@ pub struct LBM<const X: u32, const Y: u32>{
     pub compute_step: usize,
     frame_number: usize,
     work_group_size: usize,
-    submitting: bool,
+
+    x: u32,
+    y: u32,
 
 }
 
-impl<const X: u32, const Y: u32> LBM<X, Y>{
+impl LBM{
     
-    fn calculate_work_group_size() -> usize{
-        let x_dim = X.to_owned() as f32;
-        let y_dim = Y.to_owned() as f32;
+    fn calculate_work_group_size(x:u32, y:u32) -> usize{
+        let x_dim = x as f32;
+        let y_dim = y as f32;
         (x_dim * y_dim/256.0).ceil() as usize
     }
 
-    fn create_vertex_buffer(driver: &Driver) -> wgpu::Buffer{
+    fn create_vertex_buffer(driver: &Driver, x: u32, y:u32) -> wgpu::Buffer{
         driver.device.create_buffer_init(&BufferInitDescriptor{
              label: None,
-             contents: bytemuck::cast_slice(&[-1.0, 1.0, -1.0, 1.0 - 2.0/Y as f32, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32, -1.0, 1.0, -1.0 + 2.0/X as f32, 1.0, -1.0 + 2.0/X as f32, 1.0 - 2.0/Y as f32]),
+             contents: bytemuck::cast_slice(&[-1.0, 1.0, -1.0, 1.0 - 2.0/y as f32, -1.0 + 2.0/x as f32, 1.0 - 2.0/y as f32, -1.0, 1.0, -1.0 + 2.0/x as f32, 1.0, -1.0 + 2.0/x as f32, 1.0 - 2.0/y as f32]),
              usage: wgpu::BufferUsages::VERTEX
          })
      }
 
-    fn create_data_pair_bgl(device : &Device) -> wgpu::BindGroupLayout{
+    fn create_data_pair_bgl(device : &Device, x: u32, y:u32) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
         {   entries: &[
                 wgpu::BindGroupLayoutEntry{
@@ -115,7 +114,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 },
@@ -125,7 +124,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 }
@@ -134,7 +133,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_data_triple_bgl(device : &Device) -> wgpu::BindGroupLayout{
+    fn create_data_triple_bgl(device : &Device, x: u32, y:u32) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
         {  
             entries: &[
@@ -144,7 +143,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 },
@@ -154,7 +153,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 },
@@ -164,7 +163,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 }
@@ -173,7 +172,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_color_bgl(device : &Device) -> wgpu::BindGroupLayout{
+    fn create_color_bgl(device : &Device, x: u32, y:u32) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor 
             {  
                 entries: &[
@@ -183,7 +182,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                         ty: wgpu::BindingType::Buffer { 
                             ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                             has_dynamic_offset: false, 
-                            min_binding_size: wgpu::BufferSize::new((3 * X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                            min_binding_size: wgpu::BufferSize::new((3 * x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                         },
                         count: None,
                     }
@@ -192,8 +191,8 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_color_bg(device : &Device, color_bgl: &wgpu::BindGroupLayout) -> wgpu::BindGroup{
-        let color_vec = vec![0.0; 3 * X as usize * Y as usize];
+    fn create_color_bg(device : &Device, color_bgl: &wgpu::BindGroupLayout, x: u32, y:u32) -> wgpu::BindGroup{
+        let color_vec = vec![0.0; 3 * x as usize * y as usize];
         let color_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
             label: None,
             contents: bytemuck::cast_slice(&color_vec),
@@ -209,7 +208,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_data_single_bgl(device : &Device) -> wgpu::BindGroupLayout{
+    fn create_data_single_bgl(device : &Device, x: u32, y:u32) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{
             entries: &[
                 wgpu::BindGroupLayoutEntry{
@@ -218,7 +217,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
             }],
@@ -226,7 +225,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_barrier_bgl(device : &Device) -> wgpu::BindGroupLayout{
+    fn create_barrier_bgl(device : &Device, x: u32, y:u32) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{
             entries: &[
                 wgpu::BindGroupLayoutEntry{
@@ -235,7 +234,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<u32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<u32>()) as _,) 
                     },
                     count: None,
             }],
@@ -244,7 +243,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     }
 
     fn create_collide_bgl(
-        device : &Device
+        device : &Device, x: u32, y:u32
     ) -> wgpu::BindGroupLayout{
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
             label: None, 
@@ -275,7 +274,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                     ty: wgpu::BindingType::Buffer { 
                         ty: wgpu::BufferBindingType::Storage { read_only: false }, 
                         has_dynamic_offset: false, 
-                        min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<f32>()) as _,) 
+                        min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<f32>()) as _,) 
                     },
                     count: None,
                 }
@@ -360,10 +359,10 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_dimension_bg(device : &Device, bgl: &BindGroupLayout) -> wgpu::BindGroup{
+    fn create_dimension_bg(device : &Device, bgl: &BindGroupLayout, x: u32, y:u32) -> wgpu::BindGroup{
         let dimension_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
             label: None,
-            contents: bytemuck::cast_slice(&[X, Y, X * Y]),
+            contents: bytemuck::cast_slice(&[x, y, x * y]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -397,11 +396,11 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_vertex_dimension_bg(device : &Device, bgl: &BindGroupLayout) -> wgpu::BindGroup{
+    fn create_vertex_dimension_bg(device : &Device, bgl: &BindGroupLayout, x: u32, y:u32) -> wgpu::BindGroup{
         
         let dimension_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
             label: None,
-            contents: bytemuck::cast_slice(&[X, Y, X * Y]),
+            contents: bytemuck::cast_slice(&[x, y, x * y]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::VERTEX,
         });
 
@@ -425,10 +424,10 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_size_buffer(device : &Device) -> wgpu::Buffer{
+    fn create_size_buffer(device : &Device, x: u32, y:u32) -> wgpu::Buffer{
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
             label: None,
-            contents: bytemuck::bytes_of(&(X * Y)),
+            contents: bytemuck::bytes_of(&(x * y)),
             usage: wgpu::BufferUsages::UNIFORM,
         })
     }
@@ -585,23 +584,23 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn init_barrier() -> Vec<u32>{
+    fn init_barrier(x: u32, y: u32) -> Vec<u32>{
         
-        let mut border_vec = vec![0_u32; X as usize * Y as usize];
+        let mut border_vec = vec![0_u32; x as usize * y as usize];
 
-        for i in 0..X{
-            border_vec[Self::index(i, 0) as usize] = 1;
-            border_vec[Self::index(i, Y - 1) as usize] = 1;
+        for i in 0..x{
+            border_vec[Self::index_pre_init(i, 0, x) as usize] = 1;
+            border_vec[Self::index_pre_init(i, y - 1, x) as usize] = 1;
         }
 
         border_vec
     }
 
-    fn index(x: u32, y:u32) -> u32{
-        x + y * X
+    fn index_pre_init(x: u32, y:u32, max_x: u32) -> u32{
+        x + y * max_x
     }
 
-    fn set_equil(mut ux: f32, mut uy: f32, rho: f32) -> Vec<Vec<f32>>{
+    fn set_equil(mut ux: f32, mut uy: f32, rho: f32, x: u32, y: u32) -> Vec<Vec<f32>>{
     
         let mut ux_2 = ux * ux;
         let mut uy_2 = uy * uy;
@@ -622,15 +621,15 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     
         let mut vec = Vec::with_capacity(9);
     
-        vec.push(vec![rho_36th * (1.0 - ux + uy + u_sum_sq_neg - u_dot_product); X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 + uy + uy_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 + ux + uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 - ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![4.0 * rho_ninth * (1.0 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 + ux + ux_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 - ux - uy + u_sum_sq_pos - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_ninth * (1.0 - uy - uy_2 - u_dot_product);  X as usize * Y as usize]);
-        vec.push(vec![rho_36th * (1.0 + ux - uy + u_sum_sq_neg - u_dot_product);  X as usize * Y as usize]);
+        vec.push(vec![rho_36th * (1.0 - ux + uy + u_sum_sq_neg - u_dot_product); x as usize * y as usize]);
+        vec.push(vec![rho_ninth * (1.0 + uy + uy_2 - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_36th * (1.0 + ux + uy + u_sum_sq_pos - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_ninth * (1.0 - ux + ux_2 - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![4.0 * rho_ninth * (1.0 - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_ninth * (1.0 + ux + ux_2 - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_36th * (1.0 - ux - uy + u_sum_sq_pos - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_ninth * (1.0 - uy - uy_2 - u_dot_product);  x as usize * y as usize]);
+        vec.push(vec![rho_36th * (1.0 + ux - uy + u_sum_sq_neg - u_dot_product);  x as usize * y as usize]);
         vec
         
     }
@@ -678,7 +677,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    fn create_barrier_update_bgl(driver: &Driver) -> wgpu::BindGroupLayout{
+    fn create_barrier_update_bgl(driver: &Driver, x: u32, y: u32) -> wgpu::BindGroupLayout{
         driver.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor{ 
             label: None, 
             entries: &[
@@ -698,7 +697,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
                 ty: wgpu::BindingType::Buffer{ 
                     ty: wgpu::BufferBindingType::Storage { read_only: true }, 
                     has_dynamic_offset: false, 
-                    min_binding_size: wgpu::BufferSize::new((X as usize * Y as usize * mem::size_of::<u32>()) as _,)
+                    min_binding_size: wgpu::BufferSize::new((x as usize * y as usize * mem::size_of::<u32>()) as _,)
                 },
                 count: None,
             }
@@ -716,21 +715,21 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         })
     }
 
-    pub fn new(driver: &Driver, omega: f32) -> LBM<X, Y>{
+    pub fn new(driver: &Driver, omega: f32, x: u32, y:u32) -> LBM{
         
         //Create Bindgroup Layouts
-        let data_single_bgl = Self::create_data_single_bgl(&driver.device);
-        let data_pair_bgl = Self::create_data_pair_bgl(&driver.device);
-        let data_triple_bgl = Self::create_data_triple_bgl(&driver.device);
-        let collide_bgl = Self::create_collide_bgl(&driver.device);
-        let color_bgl = Self::create_color_bgl(&driver.device);
+        let data_single_bgl = Self::create_data_single_bgl(&driver.device, x, y);
+        let data_pair_bgl = Self::create_data_pair_bgl(&driver.device, x, y);
+        let data_triple_bgl = Self::create_data_triple_bgl(&driver.device, x, y);
+        let collide_bgl = Self::create_collide_bgl(&driver.device, x, y);
+        let color_bgl = Self::create_color_bgl(&driver.device, x, y);
         let size_bgl = Self::create_size_bgl(&driver.device);
         let dimension_bgl = Self::create_dimension_bgl(&driver.device);
         let dimension_vertex_bgl = Self::create_vertex_dimension_bgl(&driver.device);
-        let barrier_bgl = Self::create_barrier_bgl(&driver.device);
+        let barrier_bgl = Self::create_barrier_bgl(&driver.device, x, y);
 
         //Create Initial Conditions
-        let init_data = Self::set_equil(0.1, 0.0, 1.0);
+        let init_data = Self::set_equil(0.1, 0.0, 1.0, x, y);
         let mut data_buffers = Vec::<Vec<wgpu::Buffer>>::new();
         
         for _ in 0..2{
@@ -738,10 +737,10 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         }
 
         //Create Needed Buffers
-        let barrier_vec = Self::init_barrier();
+        let barrier_vec = Self::init_barrier(x, y);
         let barrier_buffer = Self::create_barrier_buffer(&barrier_vec, &driver.device);
         let omega_buffer = Self::create_omega_buffer(&driver.device , omega);
-        let size_buffer = Self::create_size_buffer(&driver.device);
+        let size_buffer = Self::create_size_buffer(&driver.device, x, y);
 
         //Create Bindgroups
         let mut ne_sw_bgs = Vec::<wgpu::BindGroup>::with_capacity(2);
@@ -764,7 +763,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
             &data_pair_bgl));
         }
 
-        let zero_vec = vec![0.0; X as usize * Y as usize];
+        let zero_vec = vec![0.0; x as usize * y as usize];
         let collide_bg = Self::create_collide_bg(&driver.device, &data_buffers[0][4], 
             &omega_buffer, 
             &size_buffer,
@@ -775,10 +774,10 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
         let output_bg = Self::create_data_bg(&driver.device, 
             &[&zero_vec], 
             &data_single_bgl);
-        let color_bg = Self::create_color_bg(&driver.device, &color_bgl);
+        let color_bg = Self::create_color_bg(&driver.device, &color_bgl, x, y);
         let size_bg = Self::create_size_bg(&driver.device, &size_buffer, &size_bgl);
-        let dimension_bg = Self::create_dimension_bg(&driver.device, &dimension_bgl);
-        let vertex_dimension_bg = Self::create_vertex_dimension_bg(&driver.device, &dimension_vertex_bgl);
+        let dimension_bg = Self::create_dimension_bg(&driver.device, &dimension_bgl, x, y);
+        let vertex_dimension_bg = Self::create_vertex_dimension_bg(&driver.device, &dimension_vertex_bgl, x, y);
         let barrier_bg = Self::create_barrier_bg(&driver.device, 
             &barrier_buffer, 
             &barrier_bgl);
@@ -946,14 +945,14 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
             &color_bgl, 
             &dimension_vertex_bgl);
 
-        let vertex_buffer = Self::create_vertex_buffer(driver);
+        let vertex_buffer = Self::create_vertex_buffer(driver, x, y);
 
         let draw_s = driver.device.create_shader_module(ShaderModuleDescriptor{ 
             label: None, 
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("rewritten_shaders/update_barrier/barrier_draw.wgsl")))
         });
 
-        let barrier_update_bgl = Self::create_barrier_update_bgl(driver);
+        let barrier_update_bgl = Self::create_barrier_update_bgl(driver, x, y);
 
         let barrier_update_pl = Self::create_barrier_update_pl(driver, &barrier_update_bgl, &barrier_bgl);
 
@@ -961,7 +960,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
 
         let draw_points = driver.device.create_buffer_init(&wgpu::util::BufferInitDescriptor{
             label: None,
-            contents: bytemuck::cast_slice(&vec![0 as u32;2 * X as usize * Y as usize]),
+            contents: bytemuck::cast_slice(&vec![0 as u32;2 * x as usize * y as usize]),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
@@ -1012,7 +1011,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
             cardinal_collide: cardinal_collision,
             compute_step: 0,
             frame_number: 0,
-            work_group_size: Self::calculate_work_group_size(),
+            work_group_size: Self::calculate_work_group_size(x, y),
             size_bg,
             color_bg,
             vertex_buffer,
@@ -1025,8 +1024,9 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
             jet,
             inferno,
             rho,
-            submitting: true,
             data_buffers,
+            x,
+            y,
         }
     }
 
@@ -1044,7 +1044,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     }
 
     pub fn iterate(&mut self, driver: &Driver, compute_steps: usize){
-        for i in 0..compute_steps{
+        for _ in 0..compute_steps{
             self.compute_step(driver);
         }
         let mut encoder = driver.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1055,7 +1055,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     }
 
     pub fn reset_to_equilibrium(&mut self, driver : &Driver){
-        let equilibrium_state = Self::set_equil(0.1, 0.0, 1.0);
+        let equilibrium_state = Self::set_equil(0.1, 0.0, 1.0, self.x, self.y);
         for i in 0..9{
             driver.queue.write_buffer(&self.data_buffers[0][i], 0, bytemuck::cast_slice(&equilibrium_state[i]));
             driver.queue.write_buffer(&self.data_buffers[1][i], 0, bytemuck::cast_slice(&equilibrium_state[i]));
@@ -1123,7 +1123,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
             rpass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             rpass.set_bind_group(0, &self.color_bg, &[]);
             rpass.set_bind_group(1, &self.dimension_bg_vertex, &[]);
-            rpass.draw(0..6, 0..X*Y);
+            rpass.draw(0..6, 0..self.x*self.y);
         }
         driver.queue.submit(Some(encoder.finish()));
         frame.present();
@@ -1293,7 +1293,7 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     }
 
     pub fn draw_shape(&mut self, driver : &Driver, shape: &dyn Shape){
-        self.draw_barrier_updates(driver, get_points_vector(shape, X as usize));
+        self.draw_barrier_updates(driver, get_points_vector(shape, self.x as usize));
     }
 
     fn draw_barrier_updates(&mut self,  driver : &Driver, points : Vec<u32>){
@@ -1316,4 +1316,10 @@ impl<const X: u32, const Y: u32> LBM<X, Y>{
     pub fn update_omega_buffer(&mut self,  driver : &Driver, omega: f32){
         driver.queue.write_buffer(&self.omega_buffer, 0, bytemuck::bytes_of(&omega));
     }
+
+    pub fn reset_barrier(&mut self, driver : &Driver){
+        let barrier_reset = Self::init_barrier(self.x, self.y);
+        driver.queue.write_buffer(&self.barrier_buffer, 0, bytemuck::cast_slice(&barrier_reset));
+    }
+
 }
